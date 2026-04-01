@@ -1,0 +1,53 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: spring-apps
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+
+  generators:
+    - matrix:
+        generators:
+          # Generator 1: list of apps
+          - list:
+              elements:
+                - app: spring-maven
+                - app: spring-gradle
+
+          # Generator 2: list of environments
+          - list:
+              elements:
+                - env: staging
+                  namespace: staging
+                  autoSync: true
+                - env: production
+                  namespace: production
+                  autoSync: false
+
+  template:
+    metadata:
+      name: "{{.app}}-{{.env}}"
+      namespace: argocd
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/dhanrajsr/spring-gitops.git
+        targetRevision: main
+        path: "apps/{{.app}}/helm"
+        helm:
+          valueFiles:
+            - values.yaml
+            - "values-{{.env}}.yaml"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{.namespace}}"
+      syncPolicy:
+        {{- if .autoSync }}
+        automated:
+          prune: true
+          selfHeal: true
+        {{- end }}
+        syncOptions:
+          - CreateNamespace=true
