@@ -1,34 +1,21 @@
 apiVersion: argoproj.io/v1alpha1
 kind: ApplicationSet
 metadata:
-  name: spring-apps
+  name: spring-apps-staging
   namespace: argocd
 spec:
   goTemplate: true
   goTemplateOptions: ["missingkey=error"]
 
   generators:
-    - matrix:
-        generators:
-          # Generator 1: list of apps
-          - list:
-              elements:
-                - app: spring-maven
-                - app: spring-gradle
-
-          # Generator 2: list of environments
-          - list:
-              elements:
-                - env: staging
-                  namespace: staging
-                  autoSync: true
-                - env: production
-                  namespace: production
-                  autoSync: false
+    - list:
+        elements:
+          - app: spring-maven
+          - app: spring-gradle
 
   template:
     metadata:
-      name: "{{.app}}-{{.env}}"
+      name: "{{.app}}-staging"
       namespace: argocd
     spec:
       project: default
@@ -39,15 +26,13 @@ spec:
         helm:
           valueFiles:
             - values.yaml
-            - "values-{{.env}}.yaml"
+            - values-staging.yaml
       destination:
         server: https://kubernetes.default.svc
-        namespace: "{{.namespace}}"
+        namespace: staging
       syncPolicy:
-        {{- if .autoSync }}
         automated:
           prune: true
           selfHeal: true
-        {{- end }}
         syncOptions:
           - CreateNamespace=true
