@@ -24,6 +24,9 @@ End-to-end setup for two Spring Boot applications (Maven + Gradle) with a 9-stag
 16. [Verification](#16-verification)
 17. [Accessing Services](#17-accessing-services)
 18. [Troubleshooting](#18-troubleshooting)
+19. [CD Pipeline](#19-cd-pipeline)
+20. [ApplicationSet Pattern (Pattern 3)](#20-applicationset-pattern-pattern-3)
+21. [Adding a New Application — Recommended Order](#21-adding-a-new-application--recommended-order)
 
 ---
 
@@ -1638,4 +1641,182 @@ kubectl get application spring-maven-staging -n argocd -o jsonpath='{.status.syn
 Regenerate your Docker Hub access token at hub.docker.com → Account Settings → Security → New Access Token, then update the secret:
 ```bash
 gh secret set DOCKERHUB_TOKEN --body "<new-token>" -R <your-username>/spring-boot-app
+```
+
+---
+
+## 20. ApplicationSet Pattern (Pattern 3)
+
+Instead of maintaining one ArgoCD `Application` file per app per environment, this repo uses **ApplicationSet** — a single file that generates all Application resources automatically from a list of app names.
+
+### How it works
+
+```
+argocd/
+├── app-of-apps.yaml                 # bootstraps everything (applied once via kubectl)
+├── applicationset-staging.yaml      # generates: spring-maven-staging, spring-gradle-staging
+└── applicationset-production.yaml   # generates: spring-maven-production, spring-gradle-production
+```
+
+The App of Apps watches the `argocd/` folder. When it syncs, it creates both ApplicationSets. Each ApplicationSet iterates over its `elements` list and generates one ArgoCD `Application` per entry.
+
+### Why two ApplicationSets instead of one
+
+Staging and production require different sync policies:
+- **Staging** — `automated: prune: true, selfHeal: true` (deploys immediately on git change)
+- **Production** — no `automated` block (manual approval required)
+
+ArgoCD ApplicationSet templates must be valid YAML before goTemplate processing, so conditional blocks like `{{- if .autoSync }}` cannot be used to toggle the `automated` section. Two files with hardcoded policies is the standard industry approach.
+
+### applicationset-staging.yaml
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: spring-apps-staging
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - list:
+        elements:
+          - app: spring-maven
+          - app: spring-gradle
+  template:
+    metadata:
+      name: "{{.app}}-staging"
+      namespace: argocd
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/<your-username>/spring-gitops.git
+        targetRevision: main
+        path: "apps/{{.app}}/helm"
+        helm:
+          valueFiles:
+            - values.yaml
+            - values-staging.yaml
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: staging
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+```
+
+### applicationset-production.yaml
+
+Same structure as staging but:
+- `name: "{{.app}}-production"`
+- `valueFiles` includes `values-production.yaml`
+- `namespace: production`
+- No `automated` block under `syncPolicy`
+
+### Adding a new app to an existing cluster
+
+To add `node-js-app`, append one line to the `elements` list in **both** files:
+
+```yaml
+  generators:
+    - list:
+        elements:
+          - app: spring-maven
+          - app: spring-gradle
+          - app: node-js-app      # ← add this
+```
+
+ArgoCD automatically generates `node-js-app-staging` and `node-js-app-production` Applications pointing to `apps/node-js-app/helm`.
+
+---
+
+## 21. Adding a New Application — Recommended Order
+
+Follow this order to avoid ArgoCD showing a `Missing` / `Unknown` health state.
+
+### Why order matters
+
+If you add the app to the ApplicationSet before the Docker image exists, ArgoCD creates the Application immediately but the deployment fails because the image tag in `values.yaml` does not exist on Docker Hub yet. The app shows `Missing` health until the image is pushed.
+
+### Correct order
+
+**Step 1 — Create the application repository**
+
+Create the new repo (e.g. `node-js-app`) on GitHub with:
+- Application source code
+- CI pipeline (`.github/workflows/ci.yml`)
+- `Dockerfile`
+- Set all required secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `CODECOV_TOKEN`, `GITOPS_TOKEN`
+
+**Step 2 — Push to main and let CI run**
+
+Push a commit to `main`. The CI pipeline must complete successfully through to the Docker push stage so the image exists on Docker Hub with a real SHA tag.
+
+**Step 3 — Add the Helm chart to spring-gitops**
+
+Create the Helm chart directory in spring-gitops:
+
+```
+apps/node-js-app/helm/
+├── Chart.yaml
+├── values.yaml          ← set image.repository and initial image.tag to the SHA from Step 2
+├── values-staging.yaml  ← set service.type: NodePort and nodePort
+├── values-production.yaml
+└── templates/
+    ├── deployment.yaml
+    └── service.yaml
+```
+
+**Step 4 — Add the app to both ApplicationSets**
+
+In `argocd/applicationset-staging.yaml` and `argocd/applicationset-production.yaml`, add the new app name to the `elements` list.
+
+**Step 5 — Commit and push spring-gitops**
+
+```bash
+git add apps/node-js-app/ argocd/applicationset-staging.yaml argocd/applicationset-production.yaml
+git commit -m "feat: add node-js-app to cluster"
+git push
+```
+
+ArgoCD detects the change → creates `node-js-app-staging` and `node-js-app-production` → immediately deploys because the image already exists → goes straight to `Healthy`.
+
+**Step 6 — Add the GitOps update step to the CI pipeline**
+
+In the new app's CI pipeline, add the deploy-staging job that updates the image tag in spring-gitops on every push to main:
+
+```yaml
+deploy-staging:
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: <your-username>/spring-gitops
+        token: ${{ secrets.GITOPS_TOKEN }}
+        path: spring-gitops
+    - run: |
+        sed -i "s/tag:.*/tag: ${{ github.sha }}/" \
+          spring-gitops/apps/node-js-app/helm/values.yaml
+    - run: |
+        cd spring-gitops
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add apps/node-js-app/helm/values.yaml
+        git commit -m "ci(node-js-app): update image tag to ${{ github.sha }}"
+        git push
+```
+
+### Summary
+
+| Step | Where | What |
+|------|-------|------|
+| 1 | New app repo | Create repo, CI pipeline, Dockerfile, secrets |
+| 2 | GitHub Actions | Push to main → image built and pushed to Docker Hub |
+| 3 | spring-gitops | Add `apps/node-js-app/helm/` with initial image tag |
+| 4 | spring-gitops | Append `node-js-app` to both ApplicationSet elements |
+| 5 | spring-gitops | Commit and push → ArgoCD deploys immediately |
+| 6 | New app repo | Add GitOps update step to CI pipeline |
 ```
