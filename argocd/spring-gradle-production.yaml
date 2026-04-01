@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: spring-gradle-production
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/dhanrajsr/spring-gitops.git
+    targetRevision: main
+    path: apps/spring-gradle/helm
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-production.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+    # No automated sync — manual approval required in ArgoCD UI

@@ -1,0 +1,5 @@
+replicaCount: 2
+
+service:
+  type: NodePort
+  nodePort: 30091

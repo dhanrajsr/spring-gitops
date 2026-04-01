@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────
+# Calico NetworkPolicy: Staging Namespace Isolation
+#
+# Rules:
+#   - Allow inbound traffic only from within staging namespace
+#   - Allow inbound from kube-system (DNS, health checks)
+#   - Allow inbound from argocd (health probes)
+#   - DENY all inbound from production namespace
+#   - Allow all outbound (egress)
+# ─────────────────────────────────────────────────────────────
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: staging-isolation
+  namespace: staging
+spec:
+  selector: all()
+
+  ingress:
+    # Allow traffic from within staging namespace
+    - action: Allow
+      source:
+        namespaceSelector: projectcalico.org/name == 'staging'
+
+    # Allow from kube-system (CoreDNS, metrics)
+    - action: Allow
+      source:
+        namespaceSelector: projectcalico.org/name == 'kube-system'
+
+    # Allow from argocd (health checks and sync)
+    - action: Allow
+      source:
+        namespaceSelector: projectcalico.org/name == 'argocd'
+
+    # Deny everything else (including production)
+    - action: Deny
+
+  egress:
+    # Allow all outbound traffic
+    - action: Allow

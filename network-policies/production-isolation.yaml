@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────
+# Calico NetworkPolicy: Production Namespace Isolation
+#
+# Rules:
+#   - Allow inbound traffic only from within production namespace
+#   - Allow inbound from kube-system (DNS, health checks)
+#   - Allow inbound from argocd (health probes)
+#   - DENY all inbound from staging namespace
+#   - Allow all outbound (egress)
+# ─────────────────────────────────────────────────────────────
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: production-isolation
+  namespace: production
+spec:
+  selector: all()
+
+  ingress:
+    # Allow traffic from within production namespace
+    - action: Allow
+      source:
+        namespaceSelector: projectcalico.org/name == 'production'
+
+    # Allow from kube-system (CoreDNS, metrics)
+    - action: Allow
+      source:
+        namespaceSelector: projectcalico.org/name == 'kube-system'
+
+    # Allow from argocd (health checks and sync)
+    - action: Allow
+      source:
+        namespaceSelector: projectcalico.org/name == 'argocd'
+
+    # Deny everything else (including staging)
+    - action: Deny
+
+  egress:
+    # Allow all outbound traffic
+    - action: Allow

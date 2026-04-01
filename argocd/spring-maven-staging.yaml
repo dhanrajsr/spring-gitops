@@ -1,0 +1,24 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: spring-maven-staging
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/dhanrajsr/spring-gitops.git
+    targetRevision: main
+    path: apps/spring-maven/helm
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-staging.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: staging
+  syncPolicy:
+    automated:          # Auto-sync — no approval needed for staging
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
