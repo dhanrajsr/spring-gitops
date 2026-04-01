@@ -1,6 +1,6 @@
 image:
   repository: dhanrajsubbaianind/spring-maven-app
-  tag: 49cbb1199484b14ca841b6d8f4d12af8632dddef
+  tag: 20cac8e3a72ec8cff055c4df96520c42b42209d1
   pullPolicy: Always
 
 replicaCount: 1
