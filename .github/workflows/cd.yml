@@ -80,21 +80,29 @@ jobs:
     needs: helm-validate
 
     steps:
-      - name: Wait for spring-maven staging to sync and be healthy
+      - name: Wait for spring-maven staging to be Synced
         run: |
-          kubectl exec -n argocd deploy/argocd-server -- argocd app wait spring-maven-staging \
-            --sync --health --timeout 180 \
-            --server localhost:8080 \
-            --plaintext \
-            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+          kubectl wait app/spring-maven-staging -n argocd \
+            --for=jsonpath='{.status.sync.status}'=Synced \
+            --timeout=180s
 
-      - name: Wait for spring-gradle staging to sync and be healthy
+      - name: Wait for spring-maven staging to be Healthy
         run: |
-          kubectl exec -n argocd deploy/argocd-server -- argocd app wait spring-gradle-staging \
-            --sync --health --timeout 180 \
-            --server localhost:8080 \
-            --plaintext \
-            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+          kubectl wait app/spring-maven-staging -n argocd \
+            --for=jsonpath='{.status.health.status}'=Healthy \
+            --timeout=180s
+
+      - name: Wait for spring-gradle staging to be Synced
+        run: |
+          kubectl wait app/spring-gradle-staging -n argocd \
+            --for=jsonpath='{.status.sync.status}'=Synced \
+            --timeout=180s
+
+      - name: Wait for spring-gradle staging to be Healthy
+        run: |
+          kubectl wait app/spring-gradle-staging -n argocd \
+            --for=jsonpath='{.status.health.status}'=Healthy \
+            --timeout=180s
 
   # ─────────────────────────────────────────
   # Stage 3: Approve → ArgoCD Sync Production
@@ -110,34 +118,36 @@ jobs:
       url: http://localhost:30090
 
     steps:
-      - name: Sync spring-maven production
+      - name: Trigger sync for spring-maven production
         run: |
-          kubectl exec -n argocd deploy/argocd-server -- argocd app sync spring-maven-production \
-            --timeout 120 \
-            --server localhost:8080 \
-            --plaintext \
-            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+          kubectl patch app spring-maven-production -n argocd --type=merge \
+            -p '{"operation": {"initiatedBy": {"username": "cd-pipeline"}, "sync": {}}}'
 
-      - name: Wait for spring-maven production to be healthy
+      - name: Wait for spring-maven production to be Synced
         run: |
-          kubectl exec -n argocd deploy/argocd-server -- argocd app wait spring-maven-production \
-            --health --timeout 120 \
-            --server localhost:8080 \
-            --plaintext \
-            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+          kubectl wait app/spring-maven-production -n argocd \
+            --for=jsonpath='{.status.sync.status}'=Synced \
+            --timeout=120s
 
-      - name: Sync spring-gradle production
+      - name: Wait for spring-maven production to be Healthy
         run: |
-          kubectl exec -n argocd deploy/argocd-server -- argocd app sync spring-gradle-production \
-            --timeout 120 \
-            --server localhost:8080 \
-            --plaintext \
-            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+          kubectl wait app/spring-maven-production -n argocd \
+            --for=jsonpath='{.status.health.status}'=Healthy \
+            --timeout=120s
 
-      - name: Wait for spring-gradle production to be healthy
+      - name: Trigger sync for spring-gradle production
         run: |
-          kubectl exec -n argocd deploy/argocd-server -- argocd app wait spring-gradle-production \
-            --health --timeout 120 \
-            --server localhost:8080 \
-            --plaintext \
-            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+          kubectl patch app spring-gradle-production -n argocd --type=merge \
+            -p '{"operation": {"initiatedBy": {"username": "cd-pipeline"}, "sync": {}}}'
+
+      - name: Wait for spring-gradle production to be Synced
+        run: |
+          kubectl wait app/spring-gradle-production -n argocd \
+            --for=jsonpath='{.status.sync.status}'=Synced \
+            --timeout=120s
+
+      - name: Wait for spring-gradle production to be Healthy
+        run: |
+          kubectl wait app/spring-gradle-production -n argocd \
+            --for=jsonpath='{.status.health.status}'=Healthy \
+            --timeout=120s
