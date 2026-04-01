@@ -898,7 +898,7 @@ kubectl get nodes
 ---
 
 ## 8. GitOps Repository
-**Pattern1: (Small environment less than 50 Applications)**
+### Pattern1: (Small environment less than 50 Applications)
 
 Create `spring-gitops` repository with this structure:
 
@@ -935,8 +935,8 @@ spring-gitops/
 └── .github/workflows/cd.yml
 ```
 
-**Pattern-2: ApplicationSet (the modern standard)
-**Instead of one Application per app, you use a single ApplicationSet that generates them automatically from a template:
+## Pattern-2: ApplicationSet (the modern standard)
+### Instead of one Application per app, you use a single ApplicationSet that generates them automatically from a template:
 
 
 apiVersion: argoproj.io/v1alpha1
