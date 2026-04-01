@@ -1,4 +1,4 @@
-replicaCount: 1
+replicaCount: 2   # 2 replicas needed for meaningful canary traffic split
 
 service:
   type: NodePort

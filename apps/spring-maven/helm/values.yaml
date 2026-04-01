@@ -27,3 +27,7 @@ readinessProbe:
   path: /api/health
   initialDelaySeconds: 20
   periodSeconds: 5
+
+blueGreen:
+  autoPromotionEnabled: false   # manual promotion required
+  scaleDownDelaySeconds: 30     # keep old blue pods 30s after promotion

@@ -27,3 +27,9 @@ readinessProbe:
   path: /api/health
   initialDelaySeconds: 20
   periodSeconds: 5
+
+canary:
+  # Steps defined in rollout.yaml:
+  # 20% → manual pause → 50% → 30s pause → 100%
+  # Override replicaCount per environment for meaningful traffic split
+  replicaCount: 2

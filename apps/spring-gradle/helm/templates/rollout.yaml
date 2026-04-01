@@ -1,11 +1,10 @@
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
 metadata:
   name: {{ .Release.Name }}
   namespace: {{ .Release.Namespace }}
   labels:
     app: {{ .Release.Name }}
-    version: {{ .Values.image.tag | quote }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
@@ -42,3 +41,12 @@ spec:
             limits:
               cpu: {{ .Values.resources.limits.cpu }}
               memory: {{ .Values.resources.limits.memory }}
+  strategy:
+    canary:
+      steps:
+        - setWeight: 20        # Step 1: send 20% traffic to new version
+        - pause: {}            # Step 2: pause — manual resume required
+        - setWeight: 50        # Step 3: send 50% traffic to new version
+        - pause:
+            duration: 30       # Step 4: auto-resume after 30 seconds
+        - setWeight: 100       # Step 5: full traffic to new version

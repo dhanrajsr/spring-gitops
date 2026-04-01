@@ -1,11 +1,10 @@
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
 metadata:
   name: {{ .Release.Name }}
   namespace: {{ .Release.Namespace }}
   labels:
     app: {{ .Release.Name }}
-    version: {{ .Values.image.tag | quote }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
@@ -42,3 +41,13 @@ spec:
             limits:
               cpu: {{ .Values.resources.limits.cpu }}
               memory: {{ .Values.resources.limits.memory }}
+  strategy:
+    blueGreen:
+      # Active service receives production traffic (blue)
+      activeService: {{ .Release.Name }}
+      # Preview service receives traffic to the new version (green)
+      previewService: {{ .Release.Name }}-preview
+      # Require manual promotion — do not auto-switch traffic
+      autoPromotionEnabled: {{ .Values.blueGreen.autoPromotionEnabled }}
+      # Keep old (blue) ReplicaSet for this many seconds after promotion
+      scaleDownDelaySeconds: {{ .Values.blueGreen.scaleDownDelaySeconds }}

@@ -2,4 +2,5 @@ replicaCount: 2
 
 service:
   type: NodePort
-  nodePort: 30090
+  nodePort: 30090         # active (blue) service
+  previewNodePort: 30092  # preview (green) service
