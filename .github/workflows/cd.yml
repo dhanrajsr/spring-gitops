@@ -84,7 +84,7 @@ jobs:
         run: |
           argocd app wait spring-maven-staging \
             --sync --health --timeout 180 \
-            --server localhost:31607 \
+            --server 172.18.0.3:31607 \
             --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
             --insecure
 
@@ -92,7 +92,7 @@ jobs:
         run: |
           argocd app wait spring-gradle-staging \
             --sync --health --timeout 180 \
-            --server localhost:31607 \
+            --server 172.18.0.3:31607 \
             --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
             --insecure
 
@@ -113,27 +113,27 @@ jobs:
       - name: Sync spring-maven production
         run: |
           argocd app sync spring-maven-production --timeout 120 \
-            --server localhost:31607 \
+            --server 172.18.0.3:31607 \
             --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
             --insecure
 
       - name: Wait for spring-maven production to be healthy
         run: |
           argocd app wait spring-maven-production --health --timeout 120 \
-            --server localhost:31607 \
+            --server 172.18.0.3:31607 \
             --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
             --insecure
 
       - name: Sync spring-gradle production
         run: |
           argocd app sync spring-gradle-production --timeout 120 \
-            --server localhost:31607 \
+            --server 172.18.0.3:31607 \
             --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
             --insecure
 
       - name: Wait for spring-gradle production to be healthy
         run: |
           argocd app wait spring-gradle-production --health --timeout 120 \
-            --server localhost:31607 \
+            --server 172.18.0.3:31607 \
             --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
             --insecure
