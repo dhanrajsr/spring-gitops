@@ -898,6 +898,7 @@ kubectl get nodes
 ---
 
 ## 8. GitOps Repository
+**Pattern1: (Small environment less than 50 Applications)**
 
 Create `spring-gitops` repository with this structure:
 
@@ -934,6 +935,66 @@ spring-gitops/
 └── .github/workflows/cd.yml
 ```
 
+**Pattern-2: ApplicationSet (the modern standard)
+**Instead of one Application per app, you use a single ApplicationSet that generates them automatically from a template:
+
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: spring-apps
+  namespace: argocd
+spec:
+  generators:
+    - matrix:
+        generators:
+          - list:
+              elements:
+                - app: spring-maven
+                  port: "8080"
+                - app: spring-gradle
+                  port: "8081"
+          - list:
+              elements:
+                - env: staging
+                  namespace: staging
+                  autoSync: "true"
+                - env: production
+                  namespace: production
+                  autoSync: "false"
+  template:
+    metadata:
+      name: "{{app}}-{{env}}"
+      namespace: argocd
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/dhanrajsr/spring-gitops.git
+        targetRevision: main
+        path: apps/{{app}}/helm
+        helm:
+          valueFiles:
+            - values.yaml
+            - values-{{env}}.yaml
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{namespace}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: "{{autoSync}}" == "true"
+This single file generates all 4 apps automatically. Add a new app? Just add one entry to the elements list.
+
+This is the industry standard at scale — used at companies managing 50+ apps across multiple clusters. It eliminates copy-paste between Application manifests entirely.
+Recommended order to avoid the Missing state:
+
+Step 1: Create node-js-app repo + CI pipeline
+Step 2: Push to main → CI runs → image pushed to Docker Hub
+Step 3: Add apps/node-js-app/helm/ to spring-gitops
+Step 4: Append node-js-app to ApplicationSet elements
+Step 5: Push spring-gitops → ArgoCD creates apps → immediately deploys
+        because the image already exists
+This way ArgoCD goes straight to Healthy with no intermediate Missing state.
 ---
 
 ## 9. Helm Charts
