@@ -69,77 +69,71 @@ jobs:
             --namespace production
 
   # ─────────────────────────────────────────
-  # Stage 2: Trigger ArgoCD Sync — Staging
-  # Runs automatically after Helm validation passes
-  # ArgoCD auto-sync will also pick this up,
-  # but this step forces an immediate sync
+  # Stage 2: ArgoCD Wait — Staging
+  # Runs on self-hosted runner (has access to local Kind cluster)
+  # ArgoCD auto-sync handles the actual deploy — this just waits
+  # for it to complete and confirms health
   # ─────────────────────────────────────────
   sync-staging:
-    name: ArgoCD Sync — Staging
-    runs-on: ubuntu-latest
+    name: ArgoCD Wait — Staging Healthy
+    runs-on: [self-hosted, docker, linux]
     needs: helm-validate
 
     steps:
-      - name: Install ArgoCD CLI
+      - name: Wait for spring-maven staging to sync and be healthy
         run: |
-          curl -sSL -o /usr/local/bin/argocd \
-            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x /usr/local/bin/argocd
-
-      - name: Login to ArgoCD
-        run: |
-          argocd login localhost:31607 \
-            --username admin \
-            --password ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
+          argocd app wait spring-maven-staging \
+            --sync --health --timeout 180 \
+            --server localhost:31607 \
+            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
             --insecure
 
-      - name: Sync spring-maven staging
-        run: argocd app sync spring-maven-staging --timeout 120
-
-      - name: Wait for spring-maven staging to be healthy
-        run: argocd app wait spring-maven-staging --health --timeout 120
-
-      - name: Sync spring-gradle staging
-        run: argocd app sync spring-gradle-staging --timeout 120
-
-      - name: Wait for spring-gradle staging to be healthy
-        run: argocd app wait spring-gradle-staging --health --timeout 120
+      - name: Wait for spring-gradle staging to sync and be healthy
+        run: |
+          argocd app wait spring-gradle-staging \
+            --sync --health --timeout 180 \
+            --server localhost:31607 \
+            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
+            --insecure
 
   # ─────────────────────────────────────────
   # Stage 3: Approve → ArgoCD Sync Production
   # Requires manual approval in GitHub Environments
-  # After approval, pipeline triggers ArgoCD sync
+  # Runs on self-hosted runner (has access to local Kind cluster)
   # ─────────────────────────────────────────
   sync-production:
     name: Approve → ArgoCD Sync Production
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, docker, linux]
     needs: sync-staging
     environment:
       name: production
       url: http://localhost:30090
 
     steps:
-      - name: Install ArgoCD CLI
+      - name: Sync spring-maven production
         run: |
-          curl -sSL -o /usr/local/bin/argocd \
-            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x /usr/local/bin/argocd
-
-      - name: Login to ArgoCD
-        run: |
-          argocd login localhost:31607 \
-            --username admin \
-            --password ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
+          argocd app sync spring-maven-production --timeout 120 \
+            --server localhost:31607 \
+            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
             --insecure
 
-      - name: Sync spring-maven production
-        run: argocd app sync spring-maven-production --timeout 120
-
       - name: Wait for spring-maven production to be healthy
-        run: argocd app wait spring-maven-production --health --timeout 120
+        run: |
+          argocd app wait spring-maven-production --health --timeout 120 \
+            --server localhost:31607 \
+            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
+            --insecure
 
       - name: Sync spring-gradle production
-        run: argocd app sync spring-gradle-production --timeout 120
+        run: |
+          argocd app sync spring-gradle-production --timeout 120 \
+            --server localhost:31607 \
+            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
+            --insecure
 
       - name: Wait for spring-gradle production to be healthy
-        run: argocd app wait spring-gradle-production --health --timeout 120
+        run: |
+          argocd app wait spring-gradle-production --health --timeout 120 \
+            --server localhost:31607 \
+            --auth-token ${{ secrets.ARGOCD_ADMIN_PASSWORD }} \
+            --insecure
