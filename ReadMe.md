@@ -586,13 +586,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: temurin
           cache: maven
+
       - name: Compile source code
         run: mvn clean compile -q
+
       - uses: actions/upload-artifact@v4
         with:
           name: compiled-classes
@@ -609,13 +612,16 @@ jobs:
       checks: write
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: temurin
           cache: maven
+
       - name: Run tests with coverage check
         run: mvn verify -q
+
       - name: Publish test results
         uses: dorny/test-reporter@v1
         if: always()
@@ -623,6 +629,7 @@ jobs:
           name: Maven Test Results
           path: target/surefire-reports/*.xml
           reporter: java-junit
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
@@ -638,15 +645,19 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: temurin
           cache: maven
+
       - name: Run Checkstyle
         run: mvn checkstyle:check -q
+
       - name: Run SpotBugs
         run: mvn spotbugs:check -q
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -661,16 +672,19 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: temurin
           cache: maven
+
       - name: OWASP Dependency Check
         run: |
           mvn org.owasp:dependency-check-maven:check \
             -DfailBuildOnCVSS=7 \
             --no-transfer-progress || true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -685,13 +699,16 @@ jobs:
     needs: [ test, code-quality ]
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: temurin
           cache: maven
+
       - name: Build JAR
         run: mvn clean package -DskipTests -q
+
       - uses: actions/upload-artifact@v4
         with:
           name: app-jar
@@ -705,7 +722,9 @@ jobs:
     needs: package
     steps:
       - uses: actions/checkout@v4
+
       - uses: docker/setup-buildx-action@v3
+
       - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
@@ -716,6 +735,7 @@ jobs:
           cache-to: type=gha,mode=max
           outputs: type=docker,dest=/tmp/image.tar
       - run: docker load --input /tmp/image.tar
+
       - name: Trivy scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -724,6 +744,7 @@ jobs:
           exit-code: 1
           ignore-unfixed: true
           severity: CRITICAL
+
       - uses: actions/upload-artifact@v4
         with:
           name: docker-image
@@ -742,10 +763,12 @@ jobs:
           name: docker-image
           path: /tmp
       - run: docker load --input /tmp/image.tar
+
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Tag and push
         run: |
           docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} \
@@ -770,10 +793,12 @@ jobs:
           repository: <your-username>/spring-gitops
           token: ${{ secrets.GITOPS_TOKEN }}
           path: spring-gitops
+
       - name: Update image tag
         run: |
           sed -i "s/tag:.*/tag: ${{ github.sha }}/" \
             spring-gitops/apps/spring-maven/helm/values.yaml
+
       - name: Commit and push
         run: |
           cd spring-gitops
