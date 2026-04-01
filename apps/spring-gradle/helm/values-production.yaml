@@ -1,5 +1,7 @@
 replicaCount: 2
 
 service:
-  type: NodePort
-  nodePort: 30091
+  type: ClusterIP   # ingress handles external traffic
+
+ingress:
+  host: spring-gradle.production.local

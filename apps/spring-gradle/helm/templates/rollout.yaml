@@ -43,10 +43,18 @@ spec:
               memory: {{ .Values.resources.limits.memory }}
   strategy:
     canary:
+      # Stable service receives traffic to old pods
+      stableService: {{ .Release.Name }}-stable
+      # Canary service receives traffic to new pods
+      canaryService: {{ .Release.Name }}-canary
+      # NGINX ingress controls exact traffic weight via annotations
+      trafficRouting:
+        nginx:
+          stableIngress: {{ .Release.Name }}
       steps:
-        - setWeight: 20        # Step 1: send 20% traffic to new version
-        - pause: {}            # Step 2: pause — manual resume required
-        - setWeight: 50        # Step 3: send 50% traffic to new version
+        - setWeight: 20        # Step 1: exactly 20% traffic → canary pods
+        - pause: {}            # Step 2: manual pause
+        - setWeight: 50        # Step 3: exactly 50% traffic → canary pods
         - pause:
             duration: 30       # Step 4: auto-resume after 30 seconds
-        - setWeight: 100       # Step 5: full traffic to new version
+        - setWeight: 100       # Step 5: 100% traffic → canary pods

@@ -28,8 +28,10 @@ readinessProbe:
   initialDelaySeconds: 75
   periodSeconds: 5
 
+ingress:
+  host: spring-gradle.staging.local   # override per environment
+
 canary:
   # Steps defined in rollout.yaml:
   # 20% → manual pause → 50% → 30s pause → 100%
-  # Override replicaCount per environment for meaningful traffic split
   replicaCount: 2

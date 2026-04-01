@@ -1,5 +1,7 @@
-replicaCount: 2   # 2 replicas needed for meaningful canary traffic split
+replicaCount: 2
 
 service:
-  type: NodePort
-  nodePort: 30081
+  type: ClusterIP   # ingress handles external traffic, no NodePort needed
+
+ingress:
+  host: spring-gradle.staging.local
