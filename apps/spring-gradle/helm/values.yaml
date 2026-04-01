@@ -1,6 +1,6 @@
 image:
   repository: dhanrajsubbaianind/spring-gradle-app
-  tag: 6750b27a07b5a84280fbc141c0b1dd091421aedd
+  tag: 8af6c2dc4bfab8b76de4c540025422b6e8ee9de3
   pullPolicy: Always
 
 replicaCount: 1
