@@ -32,6 +32,11 @@ spec:
       source:
         namespaceSelector: projectcalico.org/name == 'argocd'
 
+    # Allow from ingress-nginx (NGINX ingress controller)
+    - action: Allow
+      source:
+        namespaceSelector: projectcalico.org/name == 'ingress-nginx'
+
     # Deny everything else (including staging)
     - action: Deny
 
