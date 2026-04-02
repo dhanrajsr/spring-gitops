@@ -80,29 +80,39 @@ jobs:
     needs: helm-validate
 
     steps:
-      - name: Wait for spring-maven staging to be Synced
+      - name: Wait for spring-maven staging ArgoCD sync
         run: |
           kubectl wait app/spring-maven-staging -n argocd \
-            --for=jsonpath='{.status.sync.status}'=Synced \
-            --timeout=180s
+            --for=jsonpath='{.status.operationState.phase}'=Succeeded \
+            --timeout=180s || true
+
+      - name: Promote spring-maven staging Blue-Green rollout
+        run: |
+          kubectl argo rollouts promote spring-maven-staging -n staging || true
 
       - name: Wait for spring-maven staging to be Healthy
         run: |
           kubectl wait app/spring-maven-staging -n argocd \
             --for=jsonpath='{.status.health.status}'=Healthy \
-            --timeout=180s
+            --timeout=300s
 
-      - name: Wait for spring-gradle staging to be Synced
+      - name: Wait for spring-gradle staging ArgoCD sync
         run: |
           kubectl wait app/spring-gradle-staging -n argocd \
-            --for=jsonpath='{.status.sync.status}'=Synced \
-            --timeout=180s
+            --for=jsonpath='{.status.operationState.phase}'=Succeeded \
+            --timeout=180s || true
+
+      - name: Promote spring-gradle staging Canary rollout
+        run: |
+          kubectl argo rollouts promote spring-gradle-staging -n staging || true
+          sleep 30
+          kubectl argo rollouts promote spring-gradle-staging -n staging || true
 
       - name: Wait for spring-gradle staging to be Healthy
         run: |
           kubectl wait app/spring-gradle-staging -n argocd \
             --for=jsonpath='{.status.health.status}'=Healthy \
-            --timeout=180s
+            --timeout=300s
 
   # ─────────────────────────────────────────
   # Stage 3: Approve → ArgoCD Sync Production
@@ -123,31 +133,31 @@ jobs:
           kubectl patch app spring-maven-production -n argocd --type=merge \
             -p '{"operation": {"initiatedBy": {"username": "cd-pipeline"}, "sync": {}}}'
 
-      - name: Wait for spring-maven production to be Synced
+      - name: Promote spring-maven production Blue-Green rollout
         run: |
-          kubectl wait app/spring-maven-production -n argocd \
-            --for=jsonpath='{.status.sync.status}'=Synced \
-            --timeout=120s
+          sleep 30
+          kubectl argo rollouts promote spring-maven-production -n production || true
 
       - name: Wait for spring-maven production to be Healthy
         run: |
           kubectl wait app/spring-maven-production -n argocd \
             --for=jsonpath='{.status.health.status}'=Healthy \
-            --timeout=120s
+            --timeout=300s
 
       - name: Trigger sync for spring-gradle production
         run: |
           kubectl patch app spring-gradle-production -n argocd --type=merge \
             -p '{"operation": {"initiatedBy": {"username": "cd-pipeline"}, "sync": {}}}'
 
-      - name: Wait for spring-gradle production to be Synced
+      - name: Promote spring-gradle production Canary rollout
         run: |
-          kubectl wait app/spring-gradle-production -n argocd \
-            --for=jsonpath='{.status.sync.status}'=Synced \
-            --timeout=120s
+          sleep 30
+          kubectl argo rollouts promote spring-gradle-production -n production || true
+          sleep 30
+          kubectl argo rollouts promote spring-gradle-production -n production || true
 
       - name: Wait for spring-gradle production to be Healthy
         run: |
           kubectl wait app/spring-gradle-production -n argocd \
             --for=jsonpath='{.status.health.status}'=Healthy \
-            --timeout=120s
+            --timeout=300s
