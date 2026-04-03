@@ -2198,3 +2198,126 @@ for i in {1..10}; do curl -s http://spring-gradle.staging.local:8081/api/version
 | Services needed | 2 (active + preview) | 2 (stable + canary) |
 | Ingress needed | No | Yes (for exact weights) |
 | Best for | High-risk changes needing instant cutover | Gradual validation with real traffic |
+
+---
+
+## 24. Blue-Green Rollback Scenarios
+
+There are three rollback scenarios depending on when something goes wrong.
+
+---
+
+### Scenario 1 — Green pods fail health checks (automatic)
+
+If the green pods crash or fail readiness/liveness probes, Argo Rollouts automatically aborts the rollout. **Blue stays active throughout — no traffic is ever sent to the broken green.**
+
+```
+Green pods fail health checks
+      │
+      ▼
+Argo Rollouts detects failure → auto-aborts rollout
+      │
+      ▼
+Green pods scale down (after abortScaleDownDelaySeconds: 30s)
+      │
+      ▼
+Blue continues serving traffic — zero impact to users
+```
+
+**How to verify this happened:**
+```bash
+kubectl get rollout spring-maven-staging -n staging
+# Status: ✖ Degraded  (or Paused with error message)
+
+kubectl get rollout spring-maven-staging -n staging \
+  -o jsonpath='{.status.message}'
+# → "RolloutAborted: Rollout aborted update to revision X"
+```
+
+**To retry with a fixed image:**
+```bash
+# Push a new fixed image via CI — ArgoCD detects new tag and starts fresh rollout
+# OR manually update the image tag:
+kubectl argo rollouts set image spring-maven-staging \
+  spring-maven-staging=dhanrajsubbaianind/spring-maven-app:<fixed-tag> \
+  -n staging
+```
+
+---
+
+### Scenario 2 — Green is healthy but you want to rollback before promoting (manual abort)
+
+Green passed health checks, rollout is paused waiting for your approval — but you decide to not promote (e.g. you tested the preview URL and found a bug).
+
+```bash
+# Abort — green scales down, blue stays active
+kubectl argo rollouts abort spring-maven-staging -n staging
+```
+
+**Verify blue is still serving:**
+```bash
+curl http://localhost:8080/api/version   # Returns old stable version
+```
+
+**Verify green is gone:**
+```bash
+kubectl get pods -n staging -l app=spring-maven-staging
+# Only 1 pod (blue) remains
+```
+
+---
+
+### Scenario 3 — Something went wrong AFTER promotion (post-promotion rollback)
+
+You promoted green, traffic switched to green, but now you're seeing errors. Blue pods are still alive for `scaleDownDelaySeconds: 30` seconds after promotion — use this window.
+
+**Within 30 seconds of promotion:**
+```bash
+# Undo — switches active service back to blue instantly
+kubectl argo rollouts undo spring-maven-staging -n staging
+```
+
+**After 30 seconds (blue already scaled down):**
+```bash
+# Roll back to previous revision
+kubectl argo rollouts undo spring-maven-staging -n staging
+# Argo Rollouts creates a new rollout using the previous stable image
+```
+
+**Verify rollback completed:**
+```bash
+kubectl get rollout spring-maven-staging -n staging
+# Status: ✔ Healthy  with previous image tag
+
+curl http://localhost:8080/api/version   # Returns previous version
+```
+
+---
+
+### Rollback Config Reference
+
+```yaml
+blueGreen:
+  autoPromotionEnabled: false     # never auto-promote — always require manual approval
+  scaleDownDelaySeconds: 30       # keep blue pods 30s after promotion for post-promotion rollback
+  previewReplicaCount: 1          # number of green pods to run during preview
+  abortScaleDownDelaySeconds: 30  # grace period before cleaning up failed green pods
+```
+
+| Config | Purpose |
+|--------|---------|
+| `autoPromotionEnabled: false` | Blue never loses traffic without explicit human approval |
+| `scaleDownDelaySeconds: 30` | Post-promotion rollback window — blue stays alive 30s |
+| `previewReplicaCount: 1` | Limits green to 1 pod during preview (saves resources) |
+| `abortScaleDownDelaySeconds: 30` | Grace period for green cleanup on abort/failure |
+
+---
+
+### Summary — When Does Blue Stay Safe?
+
+| Scenario | Blue traffic affected? | Action needed |
+|----------|----------------------|---------------|
+| Green pods crash/fail probes | No — auto-aborted | Push fix via CI |
+| Green healthy, you abort before promoting | No | `kubectl argo rollouts abort` |
+| Post-promotion issue (within 30s) | Yes — switch back | `kubectl argo rollouts undo` |
+| Post-promotion issue (after 30s) | Yes — new rollout from old image | `kubectl argo rollouts undo` |
