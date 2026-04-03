@@ -27,6 +27,8 @@ End-to-end setup for two Spring Boot applications (Maven + Gradle) with a 9-stag
 19. [CD Pipeline](#19-cd-pipeline)
 20. [ApplicationSet Pattern (Pattern 3)](#20-applicationset-pattern-pattern-3)
 21. [Adding a New Application — Recommended Order](#21-adding-a-new-application--recommended-order)
+22. [Blue-Green Deployment (spring-maven)](#22-blue-green-deployment-spring-maven)
+23. [Canary Deployment (spring-gradle)](#23-canary-deployment-spring-gradle)
 
 ---
 
@@ -1760,3 +1762,439 @@ deploy-staging:
 | 5 | spring-gitops | Commit and push → ArgoCD deploys immediately |
 | 6 | New app repo | Add GitOps update step to CI pipeline |
 ```
+
+---
+
+## 22. Blue-Green Deployment (spring-maven)
+
+### Overview
+
+Blue-Green deployment runs two full environments simultaneously:
+- **Blue** — the current stable version receiving all live traffic
+- **Green** — the new version deployed alongside blue, receiving no traffic until promoted
+
+Traffic switches **instantly** from blue to green on promotion — zero downtime, instant rollback by switching back.
+
+```
+New image pushed
+      │
+      ▼
+ArgoCD detects new tag → creates Green ReplicaSet
+      │
+      ▼
+Green pods pass health checks → Rollout pauses (BlueGreenPause)
+      │
+      ▼
+Manual promotion → traffic switches Blue → Green instantly
+      │
+      ▼
+Old Blue pods scale down after 30 seconds
+```
+
+### Tool
+
+**Argo Rollouts** — replaces the standard Kubernetes `Deployment` with a `Rollout` CRD.
+
+### Install Argo Rollouts
+
+```bash
+# Install controller
+kubectl create namespace argo-rollouts
+kubectl apply -n argo-rollouts \
+  -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+
+# Install kubectl plugin (macOS)
+brew install argoproj/tap/kubectl-argo-rollouts
+```
+
+### Helm Chart Changes
+
+**`apps/spring-maven/helm/templates/rollout.yaml`** — replaces `deployment.yaml`:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  template:
+    # ... same pod spec as Deployment ...
+  strategy:
+    blueGreen:
+      activeService: {{ .Release.Name }}          # blue — live traffic
+      previewService: {{ .Release.Name }}-preview  # green — new version
+      autoPromotionEnabled: false                  # manual promotion required
+      scaleDownDelaySeconds: 30                    # keep blue 30s after promotion
+```
+
+**`apps/spring-maven/helm/templates/service-preview.yaml`** — green preview service:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-preview
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      nodePort: {{ .Values.service.previewNodePort }}
+```
+
+**`values-staging.yaml`:**
+```yaml
+service:
+  type: NodePort
+  nodePort: 30080         # active (blue)
+  previewNodePort: 30082  # preview (green)
+```
+
+**`values-production.yaml`:**
+```yaml
+service:
+  type: NodePort
+  nodePort: 30090         # active (blue)
+  previewNodePort: 30092  # preview (green)
+```
+
+**`values.yaml`** — add blue-green config:
+```yaml
+blueGreen:
+  autoPromotionEnabled: false
+  scaleDownDelaySeconds: 30
+```
+
+### How to Trigger
+
+Push any code change to `spring-boot-app` main branch. CI builds a new image, updates the tag in `spring-gitops/apps/spring-maven/helm/values.yaml`, and ArgoCD automatically creates the green ReplicaSet.
+
+### Validation Steps
+
+**Step 1 — Start port-forwards in separate terminals:**
+
+```bash
+# Terminal 1 — Active (Blue)
+kubectl port-forward svc/spring-maven-staging -n staging 8080:8080
+
+# Terminal 2 — Preview (Green)
+kubectl port-forward svc/spring-maven-staging-preview -n staging 8082:8080
+```
+
+**Step 2 — Confirm two versions running simultaneously:**
+
+```bash
+curl http://localhost:8080/api/version   # Blue → old version (e.g. 1.0.0)
+curl http://localhost:8082/api/version   # Green → new version (e.g. 1.1.0)
+```
+
+This proves blue and green are live at the same time with different versions.
+
+**Step 3 — Confirm live traffic only goes to Blue:**
+
+```bash
+for i in {1..5}; do curl -s http://localhost:8080/api/version; echo; done
+# All responses return old version — green is running but gets no live traffic
+```
+
+**Step 4 — Promote Green to Active:**
+
+```bash
+kubectl argo rollouts promote spring-maven-staging -n staging
+```
+
+**Step 5 — Confirm traffic switched instantly:**
+
+```bash
+# Restart port-forward first (stale connections don't follow selector changes)
+# Ctrl+C Terminal 1, then:
+kubectl port-forward svc/spring-maven-staging -n staging 8080:8080
+
+curl http://localhost:8080/api/version   # Now returns new version (1.1.0)
+```
+
+Same URL, same port — traffic switched with zero downtime.
+
+**Step 6 — Confirm old Blue cleaned up:**
+
+```bash
+# After 30 seconds (scaleDownDelaySeconds)
+kubectl get pods -n staging -l app=spring-maven-staging
+# Only 1 pod remains (the green/new one)
+```
+
+**Step 7 — Rollback (optional):**
+
+Before promoting, run:
+```bash
+kubectl argo rollouts abort spring-maven-staging -n staging
+curl http://localhost:8080/api/version   # Still returns old version — blue unchanged
+```
+
+### Watch Live Progress
+
+```bash
+kubectl get rollout spring-maven-staging -n staging -o wide -w
+```
+
+### Key Commands
+
+| Action | Command |
+|--------|---------|
+| Check status | `kubectl get rollout spring-maven-staging -n staging` |
+| Promote green | `kubectl argo rollouts promote spring-maven-staging -n staging` |
+| Abort rollback | `kubectl argo rollouts abort spring-maven-staging -n staging` |
+| Watch progress | `kubectl get rollout spring-maven-staging -n staging -w` |
+
+---
+
+## 23. Canary Deployment (spring-gradle)
+
+### Overview
+
+Canary deployment gradually shifts traffic from the old version to the new version in configurable steps — allowing validation at each step before proceeding.
+
+```
+New image pushed
+      │
+      ▼
+ArgoCD detects new tag → creates Canary pods
+      │
+      ▼
+Step 1: 20% traffic → new version  (manual pause)
+      │  ← validate here
+      ▼
+Step 2: 50% traffic → new version  (auto-resumes after 30s)
+      │
+      ▼
+Step 3: 100% traffic → new version (rollout complete)
+```
+
+### Two Approaches
+
+#### Approach 1 — Pod-based (approximate weight)
+
+Traffic split is determined by the ratio of canary to stable pods:
+- `setWeight: 20` with 5 replicas → 1 canary pod ≈ 20%
+- Approximate — depends on having enough replicas
+
+#### Approach 2 — NGINX Ingress-based (exact weight) ← what we use
+
+Argo Rollouts sets exact traffic weights via NGINX ingress annotations:
+```
+nginx.ingress.kubernetes.io/canary-weight: "20"
+```
+Exactly 20% regardless of replica count.
+
+### Install NGINX Ingress (Kind)
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+kubectl wait --for=condition=Ready pods -n ingress-nginx \
+  -l app.kubernetes.io/component=controller --timeout=120s
+```
+
+### Helm Chart Changes
+
+**`apps/spring-gradle/helm/templates/service.yaml`** — two services instead of one:
+
+```yaml
+# Stable service — receives traffic from old (stable) pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-stable
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+---
+# Canary service — receives traffic from new (canary) pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-canary
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+```
+
+**`apps/spring-gradle/helm/templates/ingress.yaml`:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-stable
+                port:
+                  number: {{ .Values.service.port }}
+```
+
+**`apps/spring-gradle/helm/templates/rollout.yaml`:**
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+spec:
+  strategy:
+    canary:
+      stableService: {{ .Release.Name }}-stable
+      canaryService: {{ .Release.Name }}-canary
+      trafficRouting:
+        nginx:
+          stableIngress: {{ .Release.Name }}   # NGINX controls exact weight
+      steps:
+        - setWeight: 20        # Step 1: exactly 20% → canary
+        - pause: {}            # Step 2: manual pause
+        - setWeight: 50        # Step 3: exactly 50% → canary
+        - pause:
+            duration: 30       # Step 4: auto-resume after 30s
+        - setWeight: 100       # Step 5: 100% → canary (complete)
+```
+
+**`values-staging.yaml`:**
+```yaml
+replicaCount: 2
+service:
+  type: ClusterIP
+ingress:
+  host: spring-gradle.staging.local
+```
+
+### Network Policy
+
+Allow NGINX ingress namespace in Calico policy (both staging and production):
+
+```yaml
+- action: Allow
+  source:
+    namespaceSelector: projectcalico.org/name == 'ingress-nginx'
+```
+
+### /etc/hosts Setup (one-time)
+
+```bash
+echo "127.0.0.1 spring-gradle.staging.local" | sudo tee -a /etc/hosts
+echo "127.0.0.1 spring-gradle.production.local" | sudo tee -a /etc/hosts
+```
+
+### How to Trigger
+
+Push any code change to `spring-boot-gradle-app` main branch. CI builds a new image and updates the tag in `spring-gitops/apps/spring-gradle/helm/values.yaml`. ArgoCD deploys canary pods and pauses at Step 1 (20%).
+
+### Validation Steps
+
+**Step 1 — Port-forward NGINX ingress:**
+
+```bash
+kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx 8081:80
+```
+
+**Step 2 — Confirm stable version before rollout:**
+
+```bash
+curl http://spring-gradle.staging.local:8081/api/version
+# Returns current stable version (e.g. 1.0.0)
+```
+
+**Step 3 — Trigger new deploy, then confirm 20% canary weight:**
+
+```bash
+# Check NGINX annotation set by Argo Rollouts
+kubectl get ingress -n staging
+# Two ingresses: spring-gradle-staging (stable) and spring-gradle-staging-canary (auto-created)
+
+kubectl get ingress spring-gradle-staging-spring-gradle-staging-canary \
+  -n staging -o jsonpath='{.metadata.annotations.nginx\.ingress\.kubernetes\.io/canary-weight}'
+# → 20
+```
+
+**Step 4 — Verify traffic split at 20%:**
+
+```bash
+for i in {1..20}; do curl -s http://spring-gradle.staging.local:8081/api/version | grep version; echo; done
+# ~4 responses with new version (20%), ~16 with old version (80%)
+# This is exact — not pod-ratio approximation
+```
+
+**Step 5 — Resume to 50% (manual promotion):**
+
+```bash
+kubectl argo rollouts promote spring-gradle-staging -n staging
+```
+
+Verify weight updated:
+```bash
+kubectl get ingress spring-gradle-staging-spring-gradle-staging-canary \
+  -n staging -o jsonpath='{.metadata.annotations.nginx\.ingress\.kubernetes\.io/canary-weight}'
+# → 50
+```
+
+```bash
+for i in {1..20}; do curl -s http://spring-gradle.staging.local:8081/api/version | grep version; echo; done
+# ~10 each version (50/50 split)
+```
+
+**Step 6 — Auto-promotes to 100% after 30 seconds:**
+
+```bash
+for i in {1..10}; do curl -s http://spring-gradle.staging.local:8081/api/version | grep version; echo; done
+# All responses return new version
+```
+
+**Step 7 — Rollback at any step (optional):**
+
+```bash
+kubectl argo rollouts abort spring-gradle-staging -n staging
+for i in {1..10}; do curl -s http://spring-gradle.staging.local:8081/api/version | grep version; echo; done
+# All responses instantly return stable version
+```
+
+### Key Commands
+
+| Action | Command |
+|--------|---------|
+| Check status | `kubectl get rollout spring-gradle-staging -n staging` |
+| Resume/promote | `kubectl argo rollouts promote spring-gradle-staging -n staging` |
+| Abort rollback | `kubectl argo rollouts abort spring-gradle-staging -n staging` |
+| Watch progress | `kubectl get rollout spring-gradle-staging -n staging -w` |
+| Check canary weight | `kubectl get ingress -n staging -o yaml \| grep canary-weight` |
+
+### Difference from Blue-Green
+
+| | Blue-Green | Canary |
+|--|--|--|
+| Traffic switch | Instant (all at once) | Gradual (step by step) |
+| Old version during deploy | Runs alongside new | Runs alongside new |
+| Rollback speed | Instant | Instant (abort) |
+| Validation window | Before promotion | At each weight step |
+| Services needed | 2 (active + preview) | 2 (stable + canary) |
+| Ingress needed | No | Yes (for exact weights) |
+| Best for | High-risk changes needing instant cutover | Gradual validation with real traffic |
