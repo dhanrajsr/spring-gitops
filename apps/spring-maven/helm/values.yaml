@@ -30,4 +30,6 @@ readinessProbe:
 
 blueGreen:
   autoPromotionEnabled: false   # manual promotion required
-  scaleDownDelaySeconds: 30     # keep old blue pods 30s after promotion
+  scaleDownDelaySeconds: 30     # keep old blue pods 30s after promotion — allows instant rollback
+  previewReplicaCount: 1        # number of green pods to spin up for preview
+  abortScaleDownDelaySeconds: 30  # scale down failed green pods 30s after abort

@@ -50,4 +50,9 @@ spec:
       # Require manual promotion — do not auto-switch traffic
       autoPromotionEnabled: {{ .Values.blueGreen.autoPromotionEnabled }}
       # Keep old (blue) ReplicaSet for this many seconds after promotion
+      # Allows instant rollback by switching active service back to blue
       scaleDownDelaySeconds: {{ .Values.blueGreen.scaleDownDelaySeconds }}
+      # If green pods fail to become Ready within this time, auto-abort
+      # and scale green back to 0 — blue stays active throughout
+      previewReplicaCount: {{ .Values.blueGreen.previewReplicaCount }}
+      abortScaleDownDelaySeconds: {{ .Values.blueGreen.abortScaleDownDelaySeconds }}
