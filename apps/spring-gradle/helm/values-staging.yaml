@@ -4,4 +4,4 @@ service:
   type: ClusterIP   # ingress handles external traffic, no NodePort needed
 
 ingress:
-  host: spring-gradle.staging.local
+  host: spring-gradle-staging.devopscab.com

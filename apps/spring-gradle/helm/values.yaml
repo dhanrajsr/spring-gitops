@@ -29,7 +29,7 @@ readinessProbe:
   periodSeconds: 5
 
 ingress:
-  host: spring-gradle.staging.local   # override per environment
+  host: spring-gradle.devopscab.com   # override per environment
 
 canary:
   # Steps defined in rollout.yaml:

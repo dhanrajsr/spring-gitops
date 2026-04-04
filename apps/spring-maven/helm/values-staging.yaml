@@ -1,6 +1,8 @@
 replicaCount: 1
 
 service:
-  type: NodePort
-  nodePort: 30080         # active (blue) service
-  previewNodePort: 30082  # preview (green) service
+  type: ClusterIP
+
+ingress:
+  host: spring-maven-staging.devopscab.com
+  previewHost: spring-maven-staging-preview.devopscab.com

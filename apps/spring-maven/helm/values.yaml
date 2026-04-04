@@ -28,6 +28,10 @@ readinessProbe:
   initialDelaySeconds: 75
   periodSeconds: 5
 
+ingress:
+  host: spring-maven.devopscab.com        # override per environment
+  previewHost: ""                          # set to enable preview ingress route
+
 blueGreen:
   autoPromotionEnabled: false   # manual promotion required
   scaleDownDelaySeconds: 30     # keep old blue pods 30s after promotion — allows instant rollback

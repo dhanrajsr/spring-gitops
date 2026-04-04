@@ -4,4 +4,4 @@ service:
   type: ClusterIP   # ingress handles external traffic
 
 ingress:
-  host: spring-gradle.production.local
+  host: spring-gradle.devopscab.com
