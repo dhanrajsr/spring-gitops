@@ -3,4 +3,4 @@ name: spring-maven-app
 description: Spring Boot Maven Application
 type: application
 version: 1.0.0
-appVersion: "1.0.0"
+appVersion: ""
