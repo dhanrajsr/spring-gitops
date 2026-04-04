@@ -29,8 +29,9 @@ readinessProbe:
   periodSeconds: 5
 
 ingress:
-  host: spring-maven.devopscab.com        # override per environment
-  previewHost: ""                          # set to enable preview ingress route
+  host: spring-maven.devopscab.com
+  previewHost: ""
+  certificateArn: arn:aws:acm:us-east-1:497041484428:certificate/aeb50a3f-01af-4fbc-9165-45acde587dee
 
 blueGreen:
   autoPromotionEnabled: false   # manual promotion required

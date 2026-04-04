@@ -6,9 +6,15 @@ metadata:
   labels:
     app: {{ .Release.Name }}
   annotations:
-    kubernetes.io/ingress.class: nginx
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: {{ .Values.ingress.certificateArn }}
+    alb.ingress.kubernetes.io/group.name: spring-apps
 spec:
-  ingressClassName: nginx
+  ingressClassName: alb
   rules:
     - host: {{ .Values.ingress.host }}
       http:

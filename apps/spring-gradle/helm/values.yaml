@@ -29,7 +29,8 @@ readinessProbe:
   periodSeconds: 5
 
 ingress:
-  host: spring-gradle.devopscab.com   # override per environment
+  host: spring-gradle.devopscab.com
+  certificateArn: arn:aws:acm:us-east-1:497041484428:certificate/aeb50a3f-01af-4fbc-9165-45acde587dee
 
 canary:
   # Steps defined in rollout.yaml:
