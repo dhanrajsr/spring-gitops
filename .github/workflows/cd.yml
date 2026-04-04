@@ -1,8 +1,6 @@
 name: GitOps CD Pipeline
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
     inputs:
       cluster:
@@ -86,7 +84,7 @@ jobs:
     name: ArgoCD Wait — Kind Staging Healthy
     runs-on: [self-hosted, docker, linux]
     needs: helm-validate
-    if: github.event_name == 'push' || inputs.cluster == 'kind'
+    if: inputs.cluster == 'kind'
 
     steps:
       - name: Set kubeconfig to Kind cluster
@@ -130,7 +128,7 @@ jobs:
     name: Approve → ArgoCD Sync Kind Production
     runs-on: [self-hosted, docker, linux]
     needs: sync-staging-kind
-    if: github.event_name == 'push' || inputs.cluster == 'kind'
+    if: inputs.cluster == 'kind'
     environment:
       name: production
       url: http://localhost:30090
