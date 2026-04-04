@@ -12,6 +12,10 @@ on:
         options: [kind, eks]
         default: kind
 
+permissions:
+  id-token: write   # Required for OIDC token exchange with AWS
+  contents: read
+
 jobs:
   # ─────────────────────────────────────────
   # Stage 1: Validate Helm Charts
@@ -182,6 +186,12 @@ jobs:
       - name: Checkout GitOps repo
         uses: actions/checkout@v4
 
+      - name: Configure AWS credentials (OIDC — keyless)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
       - name: Set kubeconfig to EKS cluster
         run: |
           aws eks update-kubeconfig \
@@ -237,6 +247,12 @@ jobs:
       url: http://localhost:30090
 
     steps:
+      - name: Configure AWS credentials (OIDC — keyless)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
       - name: Set kubeconfig to EKS cluster
         run: |
           aws eks update-kubeconfig \
