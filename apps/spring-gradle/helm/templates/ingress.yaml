@@ -23,6 +23,6 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {{ .Release.Name }}-stable
+                name: use-annotation
                 port:
-                  number: {{ .Values.service.port }}
+                  name: use-annotation

@@ -47,10 +47,11 @@ spec:
       stableService: {{ .Release.Name }}-stable
       # Canary service receives traffic to new pods
       canaryService: {{ .Release.Name }}-canary
-      # NGINX ingress controls exact traffic weight via annotations
+      # ALB ingress controls exact traffic weight via weighted target group actions
       trafficRouting:
-        nginx:
-          stableIngress: {{ .Release.Name }}
+        alb:
+          ingress: {{ .Release.Name }}
+          servicePort: {{ .Values.service.port }}
       steps:
         - setWeight: 20        # Step 1: exactly 20% traffic → canary pods
         - pause: {}            # Step 2: manual pause
