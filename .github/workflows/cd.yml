@@ -4,6 +4,13 @@ on:
   push:
     branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      cluster:
+        description: "Target cluster"
+        required: true
+        type: choice
+        options: [kind, eks]
+        default: kind
 
 jobs:
   # ─────────────────────────────────────────
@@ -11,14 +18,14 @@ jobs:
   # ─────────────────────────────────────────
   helm-validate:
     name: Validate Helm Charts
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, docker, linux]
 
     steps:
       - name: Checkout GitOps repo
         uses: actions/checkout@v4
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        run: helm version
 
       - name: Lint spring-maven Helm chart
         run: |
@@ -69,17 +76,18 @@ jobs:
             --namespace production
 
   # ─────────────────────────────────────────
-  # Stage 2: ArgoCD Wait — Staging
-  # Runs on self-hosted runner (has access to local Kind cluster)
-  # ArgoCD auto-sync handles the actual deploy — this just waits
-  # for it to complete and confirms health
+  # Stage 2: Deploy to Kind (local cluster)
   # ─────────────────────────────────────────
-  sync-staging:
-    name: ArgoCD Wait — Staging Healthy
+  sync-staging-kind:
+    name: ArgoCD Wait — Kind Staging Healthy
     runs-on: [self-hosted, docker, linux]
     needs: helm-validate
+    if: github.event_name == 'push' || inputs.cluster == 'kind'
 
     steps:
+      - name: Set kubeconfig to Kind cluster
+        run: kubectl config use-context kind-calico-prod
+
       - name: Wait for spring-maven staging ArgoCD sync
         run: |
           kubectl wait app/spring-maven-staging -n argocd \
@@ -114,20 +122,19 @@ jobs:
             --for=jsonpath='{.status.health.status}'=Healthy \
             --timeout=300s
 
-  # ─────────────────────────────────────────
-  # Stage 3: Approve → ArgoCD Sync Production
-  # Requires manual approval in GitHub Environments
-  # Runs on self-hosted runner (has access to local Kind cluster)
-  # ─────────────────────────────────────────
-  sync-production:
-    name: Approve → ArgoCD Sync Production
+  sync-production-kind:
+    name: Approve → ArgoCD Sync Kind Production
     runs-on: [self-hosted, docker, linux]
-    needs: sync-staging
+    needs: sync-staging-kind
+    if: github.event_name == 'push' || inputs.cluster == 'kind'
     environment:
       name: production
       url: http://localhost:30090
 
     steps:
+      - name: Set kubeconfig to Kind cluster
+        run: kubectl config use-context kind-calico-prod
+
       - name: Trigger sync for spring-maven production
         run: |
           kubectl patch app spring-maven-production -n argocd --type=merge \
@@ -159,5 +166,113 @@ jobs:
       - name: Wait for spring-gradle production to be Healthy
         run: |
           kubectl wait app/spring-gradle-production -n argocd \
+            --for=jsonpath='{.status.health.status}'=Healthy \
+            --timeout=300s
+
+  # ─────────────────────────────────────────
+  # Stage 3: Deploy to EKS
+  # ─────────────────────────────────────────
+  sync-staging-eks:
+    name: ArgoCD Wait — EKS Staging Healthy
+    runs-on: [self-hosted, docker, linux]
+    needs: helm-validate
+    if: inputs.cluster == 'eks'
+
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+
+      - name: Set kubeconfig to EKS cluster
+        run: |
+          aws eks update-kubeconfig \
+            --region us-east-1 \
+            --name eks-dev-us-east-1
+
+      - name: Apply ArgoCD ApplicationSets
+        run: |
+          kubectl apply --server-side -f argocd/applicationset-eks-staging.yaml
+          kubectl apply --server-side -f argocd/applicationset-eks-production.yaml
+
+      - name: Wait for spring-maven eks-staging ArgoCD sync
+        run: |
+          kubectl wait app/spring-maven-eks-staging -n argocd \
+            --for=jsonpath='{.status.operationState.phase}'=Succeeded \
+            --timeout=180s || true
+
+      - name: Promote spring-maven eks-staging Blue-Green rollout
+        run: |
+          kubectl argo rollouts promote spring-maven-eks-staging -n staging || true
+
+      - name: Wait for spring-maven eks-staging to be Healthy
+        run: |
+          kubectl wait app/spring-maven-eks-staging -n argocd \
+            --for=jsonpath='{.status.health.status}'=Healthy \
+            --timeout=300s
+
+      - name: Wait for spring-gradle eks-staging ArgoCD sync
+        run: |
+          kubectl wait app/spring-gradle-eks-staging -n argocd \
+            --for=jsonpath='{.status.operationState.phase}'=Succeeded \
+            --timeout=180s || true
+
+      - name: Promote spring-gradle eks-staging Canary rollout
+        run: |
+          kubectl argo rollouts promote spring-gradle-eks-staging -n staging || true
+          sleep 30
+          kubectl argo rollouts promote spring-gradle-eks-staging -n staging || true
+
+      - name: Wait for spring-gradle eks-staging to be Healthy
+        run: |
+          kubectl wait app/spring-gradle-eks-staging -n argocd \
+            --for=jsonpath='{.status.health.status}'=Healthy \
+            --timeout=300s
+
+  sync-production-eks:
+    name: Approve → ArgoCD Sync EKS Production
+    runs-on: [self-hosted, docker, linux]
+    needs: sync-staging-eks
+    if: inputs.cluster == 'eks'
+    environment:
+      name: production
+      url: http://localhost:30090
+
+    steps:
+      - name: Set kubeconfig to EKS cluster
+        run: |
+          aws eks update-kubeconfig \
+            --region us-east-1 \
+            --name eks-dev-us-east-1
+
+      - name: Trigger sync for spring-maven eks-production
+        run: |
+          kubectl patch app spring-maven-eks-production -n argocd --type=merge \
+            -p '{"operation": {"initiatedBy": {"username": "cd-pipeline"}, "sync": {}}}'
+
+      - name: Promote spring-maven eks-production Blue-Green rollout
+        run: |
+          sleep 30
+          kubectl argo rollouts promote spring-maven-eks-production -n production || true
+
+      - name: Wait for spring-maven eks-production to be Healthy
+        run: |
+          kubectl wait app/spring-maven-eks-production -n argocd \
+            --for=jsonpath='{.status.health.status}'=Healthy \
+            --timeout=300s
+
+      - name: Trigger sync for spring-gradle eks-production
+        run: |
+          kubectl patch app spring-gradle-eks-production -n argocd --type=merge \
+            -p '{"operation": {"initiatedBy": {"username": "cd-pipeline"}, "sync": {}}}'
+
+      - name: Promote spring-gradle eks-production Canary rollout
+        run: |
+          sleep 30
+          kubectl argo rollouts promote spring-gradle-eks-production -n production || true
+          sleep 30
+          kubectl argo rollouts promote spring-gradle-eks-production -n production || true
+
+      - name: Wait for spring-gradle eks-production to be Healthy
+        run: |
+          kubectl wait app/spring-gradle-eks-production -n argocd \
             --for=jsonpath='{.status.health.status}'=Healthy \
             --timeout=300s

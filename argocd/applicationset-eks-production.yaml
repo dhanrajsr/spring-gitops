@@ -1,0 +1,36 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: spring-apps-eks-production
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+
+  generators:
+    - list:
+        elements:
+          - app: spring-maven
+          - app: spring-gradle
+
+  template:
+    metadata:
+      name: "{{.app}}-eks-production"
+      namespace: argocd
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/dhanrajsr/spring-gitops.git
+        targetRevision: main
+        path: "apps/{{.app}}/helm"
+        helm:
+          valueFiles:
+            - values.yaml
+            - values-production.yaml
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: production
+      syncPolicy:
+        syncOptions:
+          - CreateNamespace=true
+        # No automated sync — manual approval required for production
