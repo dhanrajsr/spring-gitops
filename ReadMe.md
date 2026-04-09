@@ -29,6 +29,18 @@ End-to-end setup for two Spring Boot applications (Maven + Gradle) with a 9-stag
 21. [Adding a New Application — Recommended Order](#21-adding-a-new-application--recommended-order)
 22. [Blue-Green Deployment (spring-maven)](#22-blue-green-deployment-spring-maven)
 23. [Canary Deployment (spring-gradle)](#23-canary-deployment-spring-gradle)
+24. [Blue-Green Rollback Scenarios](#24-blue-green-rollback-scenarios)
+25. [ArgoCD on EKS — Production Setup](#25-argocd-on-eks--production-setup)
+    - [Configure kubectl for EKS](#step-1--configure-kubectl-for-eks)
+    - [Install ArgoCD on EKS](#step-2--install-argocd-on-eks)
+    - [Expose ArgoCD UI via LoadBalancer](#step-3--expose-argocd-ui)
+    - [Install Argo Rollouts](#step-4--install-argo-rollouts-on-eks)
+    - [Deploy Applications](#step-5--deploy-applications-via-argocd)
+    - [Blue-Green on EKS with real DNS](#step-7--blue-green-deployment-on-eks-production)
+    - [Monitor Rollout Status](#step-8--monitor-rollout-status)
+    - [Key Commands Reference](#argocd-key-commands-reference)
+    - [Kind vs EKS Differences](#difference-kind-cluster-vs-eks)
+    - [Troubleshooting](#troubleshooting-argocd-on-eks)
 
 ---
 
@@ -2321,3 +2333,311 @@ blueGreen:
 | Green healthy, you abort before promoting | No | `kubectl argo rollouts abort` |
 | Post-promotion issue (within 30s) | Yes — switch back | `kubectl argo rollouts undo` |
 | Post-promotion issue (after 30s) | Yes — new rollout from old image | `kubectl argo rollouts undo` |
+
+---
+
+## 25. ArgoCD on EKS — Production Setup
+
+This section covers deploying and using ArgoCD on the actual AWS EKS cluster (`eks-dev-us-east-1`), as opposed to the local Kind cluster used in earlier sections.
+
+---
+
+### Prerequisites
+
+- EKS cluster provisioned (`aws-eks` Terraform apply completed)
+- `kubectl` and `aws` CLI installed locally
+- Cluster access configured (see below)
+
+---
+
+### Step 1 — Configure kubectl for EKS
+
+```bash
+# Update kubeconfig to point to EKS cluster
+aws eks update-kubeconfig --region us-east-1 --name eks-dev-us-east-1
+
+# Verify cluster access
+kubectl get nodes
+# Expected: ip-10-0-x-x.ec2.internal   Ready   <none>   ...
+```
+
+**If you get "server has asked for credentials" error:**
+```bash
+# Grant your IAM identity cluster admin access
+aws eks create-access-entry \
+  --cluster-name eks-dev-us-east-1 \
+  --principal-arn arn:aws:iam::497041484428:root \
+  --type STANDARD
+
+aws eks associate-access-policy \
+  --cluster-name eks-dev-us-east-1 \
+  --principal-arn arn:aws:iam::497041484428:root \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+  --access-scope type=cluster
+
+# Retry
+kubectl get nodes
+```
+
+---
+
+### Step 2 — Install ArgoCD on EKS
+
+```bash
+# Create namespace
+kubectl create namespace argocd
+
+# Download and apply manifest (avoids pipe encoding issues)
+curl -sL https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml \
+  -o /tmp/argocd-install.yaml
+kubectl apply -n argocd -f /tmp/argocd-install.yaml
+
+# Wait for all pods to be running
+kubectl wait --for=condition=Ready pods --all -n argocd --timeout=300s
+
+# Verify
+kubectl get pods -n argocd
+# Expected: argocd-server, argocd-application-controller, argocd-repo-server,
+#           argocd-redis, argocd-dex-server, argocd-applicationset-controller — all Running
+```
+
+---
+
+### Step 3 — Expose ArgoCD UI
+
+On EKS, expose ArgoCD via AWS LoadBalancer (not NodePort like Kind):
+
+```bash
+# Patch to LoadBalancer type — AWS auto-provisions an ALB/NLB
+kubectl patch svc argocd-server -n argocd \
+  -p '{"spec": {"type": "LoadBalancer"}}'
+
+# Wait ~60s for ELB to provision, then get the URL
+kubectl get svc argocd-server -n argocd
+# EXTERNAL-IP column shows: xxxx.us-east-1.elb.amazonaws.com
+
+# Get the initial admin password
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o go-template='{{.data.password | base64decode}}' && echo
+```
+
+**Access the UI:**
+- URL: `https://<elb-hostname>` (accept self-signed cert warning in browser)
+- Username: `admin`
+- Password: output of command above
+
+> Change the password after first login: ArgoCD UI → User Info → Update Password
+
+---
+
+### Step 4 — Install Argo Rollouts on EKS
+
+Argo Rollouts is the controller that handles Blue-Green and Canary strategies:
+
+```bash
+# Create namespace
+kubectl create namespace argo-rollouts
+
+# Download and apply manifest
+curl -sL https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml \
+  -o /tmp/argo-rollouts-install.yaml
+kubectl apply -n argo-rollouts -f /tmp/argo-rollouts-install.yaml
+
+# Verify
+kubectl get pods -n argo-rollouts
+# Expected: argo-rollouts-xxxx   Running
+
+# Install kubectl plugin (macOS) — gives you 'kubectl argo rollouts' commands
+brew install argoproj/tap/kubectl-argo-rollouts
+```
+
+---
+
+### Step 5 — Deploy Applications via ArgoCD
+
+```bash
+# Create app namespaces
+kubectl create namespace staging
+kubectl create namespace production
+
+# Apply ArgoCD Application manifests from this repo
+kubectl apply -f argocd/spring-maven-staging.yaml
+kubectl apply -f argocd/spring-maven-production.yaml
+kubectl apply -f argocd/spring-gradle-staging.yaml
+kubectl apply -f argocd/spring-gradle-production.yaml
+
+# Verify apps appear in ArgoCD
+kubectl get applications -n argocd
+```
+
+In the **ArgoCD UI**:
+- You'll see 4 applications: `spring-maven-staging`, `spring-maven-production`, `spring-gradle-staging`, `spring-gradle-production`
+- Staging apps: **auto-sync** on every Git push
+- Production apps: **manual sync** — you click Sync in the UI
+
+---
+
+### Step 6 — Sync an Application
+
+**Via UI:**
+1. Open ArgoCD UI → click `spring-maven-production`
+2. Click **Sync** → **Synchronize**
+3. Watch pods come up in real time in the UI
+
+**Via CLI:**
+```bash
+# Login to ArgoCD CLI
+argocd login <elb-hostname> --username admin --password <password> --insecure
+
+# Sync app
+argocd app sync spring-maven-production
+
+# Check app status
+argocd app get spring-maven-production
+```
+
+---
+
+### Step 7 — Blue-Green Deployment on EKS (Production)
+
+Unlike Kind (port-forward), on EKS traffic is served via real DNS and ALB Ingress.
+
+**The two URLs (production namespace):**
+
+| URL | Service | Version served |
+|---|---|---|
+| `spring-maven.devopscab.com` | `spring-maven` (active) | Blue — live users |
+| `spring-maven-preview.devopscab.com` | `spring-maven-preview` | Green — testing only |
+
+**Full deployment cycle:**
+
+```
+1. Developer pushes code to spring-boot-maven-app
+         ↓
+2. CI pipeline: build → test → docker push → update values.yaml image tag → push to spring-gitops
+         ↓
+3. ArgoCD detects new image tag in spring-gitops → marks app OutOfSync
+         ↓
+4. ArgoCD syncs → Argo Rollouts creates Green ReplicaSet (v2)
+   Blue (v1) still serves 100% traffic on spring-maven.devopscab.com
+         ↓
+5. Green pods pass liveness/readiness probes → Rollout pauses at BlueGreenPause
+   Green available on: spring-maven-preview.devopscab.com
+         ↓
+6. QA tests the preview URL (v2) — users unaffected on production URL
+         ↓
+7. Approve → Promote Green to active
+         ↓
+8. Traffic switches instantly: spring-maven.devopscab.com now serves v2
+   Blue (v1) pods stay alive for 30s (rollback window)
+         ↓
+9. After 30s — Blue pods removed. Rollout complete.
+```
+
+**Promote Green to production:**
+```bash
+# CLI
+kubectl argo rollouts promote spring-maven -n production
+
+# Watch live
+kubectl argo rollouts get rollout spring-maven -n production --watch
+```
+
+**Rollback before promotion (Green failed testing):**
+```bash
+kubectl argo rollouts abort spring-maven -n production
+# Blue continues serving traffic — Green pods removed
+```
+
+**Rollback after promotion (within 30s — Blue still alive):**
+```bash
+kubectl argo rollouts undo spring-maven -n production
+# Traffic switches back to Blue instantly
+```
+
+---
+
+### Step 8 — Monitor Rollout Status
+
+```bash
+# Summary view
+kubectl argo rollouts get rollout spring-maven -n production
+
+# Live watch (updates every second)
+kubectl argo rollouts get rollout spring-maven -n production --watch
+
+# Check all rollouts across namespaces
+kubectl get rollouts -A
+
+# Describe rollout for events and history
+kubectl describe rollout spring-maven -n production
+```
+
+**In ArgoCD UI:**
+- Click the app → you'll see the Rollout resource
+- It shows: Blue ReplicaSet (stable), Green ReplicaSet (canary/preview), Pause status
+- Click **Promote** button directly in the UI
+
+---
+
+### Step 9 — Connect ArgoCD to GitHub (Private Repos)
+
+If your repos are private, add credentials so ArgoCD can pull manifests:
+
+```bash
+# Via CLI
+argocd repo add https://github.com/dhanrajsr/spring-gitops.git \
+  --username dhanrajsr \
+  --password <github-pat-token>
+
+# Verify
+argocd repo list
+```
+
+Or via **UI**: Settings → Repositories → Connect Repo
+
+---
+
+### ArgoCD Key Commands Reference
+
+| Action | Command |
+|---|---|
+| List all apps | `argocd app list` |
+| Sync app | `argocd app sync <app-name>` |
+| Get app status | `argocd app get <app-name>` |
+| Check diff (what will change) | `argocd app diff <app-name>` |
+| Hard refresh (bypass cache) | `argocd app get <app-name> --hard-refresh` |
+| Delete app | `argocd app delete <app-name>` |
+| Promote Blue-Green | `kubectl argo rollouts promote <rollout-name> -n <namespace>` |
+| Abort (keep Blue) | `kubectl argo rollouts abort <rollout-name> -n <namespace>` |
+| Undo (rollback) | `kubectl argo rollouts undo <rollout-name> -n <namespace>` |
+| Watch rollout | `kubectl argo rollouts get rollout <name> -n <namespace> --watch` |
+| Pause rollout | `kubectl argo rollouts pause <rollout-name> -n <namespace>` |
+| Restart rollout | `kubectl argo rollouts restart <rollout-name> -n <namespace>` |
+
+---
+
+### Difference: Kind Cluster vs EKS
+
+| | Kind (local) | EKS (production) |
+|---|---|---|
+| Access ArgoCD UI | `kubectl port-forward` + `localhost:8443` | LoadBalancer ELB URL |
+| App traffic | `kubectl port-forward` or NodePort | ALB Ingress + Route53 DNS |
+| Preview URL | `localhost:8082` | `spring-maven-preview.devopscab.com` |
+| Image pull | Docker Hub (public) | Docker Hub or ECR |
+| State | Ephemeral (lost on Mac restart) | Persistent (AWS managed) |
+| Cost | Free | ~$0.10/hr for EKS control plane + EC2 nodes |
+
+---
+
+### Troubleshooting ArgoCD on EKS
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| App stuck `OutOfSync` after sync | Helm render error | `argocd app get <name>` → check conditions |
+| `ComparisonError` | ArgoCD can't reach git repo | Add repo credentials in ArgoCD Settings |
+| Rollout stuck at `Paused` | Waiting for manual promotion | `kubectl argo rollouts promote <name> -n <ns>` |
+| Green pods not starting | Image pull error or probe failure | `kubectl describe pod <green-pod> -n production` |
+| ArgoCD UI not accessible | ELB still provisioning | Wait 60–90s after `kubectl patch svc` |
+| `ImagePullBackOff` on Green | Wrong image tag in values.yaml | Fix tag in spring-gitops → ArgoCD re-syncs |
+| Old Blue pods not scaling down | `scaleDownDelaySeconds` in progress | Wait 30s — or check `kubectl get rs -n production` |
