@@ -1,0 +1,79 @@
+{{- if .Values.keda.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    # Tells KEDA not to conflict with HPA — KEDA manages its own HPA internally
+    scaledobject.keda.sh/transfer-hpa-ownership: "true"
+spec:
+  # Target the Argo Rollout
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: {{ .Release.Name }}
+
+  minReplicaCount: {{ .Values.keda.minReplicas }}
+  maxReplicaCount: {{ .Values.keda.maxReplicas }}
+
+  # How often KEDA checks the scaler metrics (seconds)
+  pollingInterval: {{ .Values.keda.pollingInterval }}
+
+  # How long all triggers must be inactive before scaling to minReplica
+  cooldownPeriod: {{ .Values.keda.cooldownPeriod }}
+
+  triggers:
+    {{- if .Values.keda.http.enabled }}
+    # ── HTTP Request Count Scaler ─────────────────────────────
+    # Scales based on incoming HTTP requests per second.
+    # Requires keda-add-ons-http-addon to be installed.
+    - type: http
+      metadata:
+        hosts: {{ .Values.keda.http.hosts | toJson }}
+        scalingMetric: requestRate        # scale on requests/sec
+        targetPendingRequests: {{ .Values.keda.http.targetRequestsPerSecond | quote }}
+        granularity: 1s
+        window: 1m
+    {{- end }}
+
+    {{- if .Values.keda.sqs.enabled }}
+    # ── AWS SQS Queue Scaler ─────────────────────────────────
+    # Scales based on number of messages in an SQS queue.
+    # Useful when app processes async jobs from a queue.
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: {{ .Release.Name }}-keda-auth
+      metadata:
+        queueURL: {{ .Values.keda.sqs.queueURL }}
+        queueLength: {{ .Values.keda.sqs.targetQueueLength | quote }}
+        awsRegion: {{ .Values.keda.sqs.region }}
+        scaleOnInFlight: "true"           # count in-flight messages too
+    {{- end }}
+
+    {{- if .Values.keda.cron.enabled }}
+    # ── Cron Scaler ───────────────────────────────────────────
+    # Scales to a fixed replica count on a schedule.
+    # Useful for pre-scaling before known traffic spikes (e.g. 9am start).
+    - type: cron
+      metadata:
+        timezone: {{ .Values.keda.cron.timezone }}
+        start: {{ .Values.keda.cron.start | quote }}    # scale up at this time
+        end: {{ .Values.keda.cron.end | quote }}        # scale down at this time
+        desiredReplicas: {{ .Values.keda.cron.desiredReplicas | quote }}
+    {{- end }}
+
+---
+{{- if .Values.keda.sqs.enabled }}
+# TriggerAuthentication — passes AWS credentials to KEDA SQS scaler
+# Uses IAM Role via IRSA (no hardcoded keys needed)
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ .Release.Name }}-keda-auth
+  namespace: {{ .Release.Namespace }}
+spec:
+  podIdentity:
+    provider: aws       # uses the pod's IAM role (IRSA)
+{{- end }}
+{{- end }}

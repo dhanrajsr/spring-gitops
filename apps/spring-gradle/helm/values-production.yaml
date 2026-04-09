@@ -1,7 +1,42 @@
 replicaCount: 2
 
 service:
-  type: ClusterIP   # ingress handles external traffic
+  type: ClusterIP
 
 ingress:
   host: spring-gradle.devopscab.com
+
+# ── HPA enabled in production ─────────────────────────────────────
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilization: 70
+  targetMemoryUtilization: 80
+
+# ── KEDA enabled in production ────────────────────────────────────
+keda:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  pollingInterval: 30
+  cooldownPeriod: 120
+
+  http:
+    enabled: true
+    hosts:
+      - spring-gradle.devopscab.com
+    targetRequestsPerSecond: "100"
+
+  sqs:
+    enabled: false
+    queueURL: ""
+    targetQueueLength: "10"
+    region: us-east-1
+
+  cron:
+    enabled: true
+    timezone: Asia/Kolkata
+    start: "0 8 * * 1-5"
+    end: "0 20 * * 1-5"
+    desiredReplicas: "3"

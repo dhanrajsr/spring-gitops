@@ -36,3 +36,38 @@ canary:
   # Steps defined in rollout.yaml:
   # 20% → manual pause → 50% → 30s pause → 100%
   replicaCount: 2
+
+# ── HPA (CPU/Memory based autoscaling) ───────────────────────────
+hpa:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilization: 70
+  targetMemoryUtilization: 80
+
+# ── KEDA (Event-driven autoscaling) ──────────────────────────────
+keda:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  pollingInterval: 30
+  cooldownPeriod: 120
+
+  http:
+    enabled: false
+    hosts:
+      - spring-gradle.devopscab.com
+    targetRequestsPerSecond: "100"
+
+  sqs:
+    enabled: false
+    queueURL: ""
+    targetQueueLength: "10"
+    region: us-east-1
+
+  cron:
+    enabled: false
+    timezone: Asia/Kolkata
+    start: "0 8 * * 1-5"
+    end: "0 20 * * 1-5"
+    desiredReplicas: "3"

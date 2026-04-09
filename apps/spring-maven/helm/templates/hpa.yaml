@@ -1,0 +1,49 @@
+{{- if .Values.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  # Target the Argo Rollout (not a Deployment)
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: {{ .Release.Name }}
+
+  minReplicas: {{ .Values.hpa.minReplicas }}
+  maxReplicas: {{ .Values.hpa.maxReplicas }}
+
+  metrics:
+    # Scale on CPU utilisation
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.hpa.targetCPUUtilization }}
+
+    # Scale on Memory utilisation
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.hpa.targetMemoryUtilization }}
+
+  behavior:
+    scaleUp:
+      # React quickly to traffic spikes — add pods fast
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2                  # add up to 2 pods at a time
+          periodSeconds: 30
+    scaleDown:
+      # Scale down slowly — avoid flapping
+      stabilizationWindowSeconds: 180
+      policies:
+        - type: Pods
+          value: 1                  # remove 1 pod at a time
+          periodSeconds: 60
+{{- end }}

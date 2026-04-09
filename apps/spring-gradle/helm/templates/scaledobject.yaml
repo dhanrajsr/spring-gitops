@@ -1,0 +1,62 @@
+{{- if .Values.keda.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    scaledobject.keda.sh/transfer-hpa-ownership: "true"
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: {{ .Release.Name }}
+
+  minReplicaCount: {{ .Values.keda.minReplicas }}
+  maxReplicaCount: {{ .Values.keda.maxReplicas }}
+  pollingInterval: {{ .Values.keda.pollingInterval }}
+  cooldownPeriod: {{ .Values.keda.cooldownPeriod }}
+
+  triggers:
+    {{- if .Values.keda.http.enabled }}
+    - type: http
+      metadata:
+        hosts: {{ .Values.keda.http.hosts | toJson }}
+        scalingMetric: requestRate
+        targetPendingRequests: {{ .Values.keda.http.targetRequestsPerSecond | quote }}
+        granularity: 1s
+        window: 1m
+    {{- end }}
+
+    {{- if .Values.keda.sqs.enabled }}
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: {{ .Release.Name }}-keda-auth
+      metadata:
+        queueURL: {{ .Values.keda.sqs.queueURL }}
+        queueLength: {{ .Values.keda.sqs.targetQueueLength | quote }}
+        awsRegion: {{ .Values.keda.sqs.region }}
+        scaleOnInFlight: "true"
+    {{- end }}
+
+    {{- if .Values.keda.cron.enabled }}
+    - type: cron
+      metadata:
+        timezone: {{ .Values.keda.cron.timezone }}
+        start: {{ .Values.keda.cron.start | quote }}
+        end: {{ .Values.keda.cron.end | quote }}
+        desiredReplicas: {{ .Values.keda.cron.desiredReplicas | quote }}
+    {{- end }}
+
+---
+{{- if .Values.keda.sqs.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ .Release.Name }}-keda-auth
+  namespace: {{ .Release.Namespace }}
+spec:
+  podIdentity:
+    provider: aws
+{{- end }}
+{{- end }}

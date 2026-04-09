@@ -49,6 +49,13 @@ End-to-end setup for two Spring Boot applications (Maven + Gradle) with a 9-stag
     - [Step 4 — Add CI GitOps Update Step](#step-4--add-gitops-update-step-to-app-ci-pipeline)
     - [Full Lifecycle After Setup](#full-lifecycle-after-setup)
     - [Onboarding Checklist](#checklist--new-application-onboarding)
+27. [HPA and KEDA — Autoscaling Setup](#27-hpa-and-keda--autoscaling-setup)
+    - [Prerequisites — Metrics Server + KEDA install](#prerequisites)
+    - [HPA Configuration](#hpa-configuration)
+    - [KEDA Scalers — HTTP, SQS, Cron](#keda-configuration)
+    - [HPA + KEDA with Blue-Green](#hpa--keda-with-blue-green-argo-rollouts)
+    - [Environment Strategy](#environment-strategy)
+    - [Troubleshooting](#troubleshooting-1)
 
 ---
 
@@ -3048,3 +3055,257 @@ Production: shows OutOfSync in UI → you click Sync → Green deploys
 □ Set GITOPS_PAT secret in app repo
 □ Push a commit → verify ArgoCD detects and deploys
 ```
+
+---
+
+## 27. HPA and KEDA — Autoscaling Setup
+
+---
+
+### Overview
+
+Without autoscaling, `replicaCount` is a fixed number — pods never increase under load. This section adds two layers of autoscaling:
+
+| | HPA | KEDA |
+|---|---|---|
+| Full name | Horizontal Pod Autoscaler | Kubernetes Event Driven Autoscaling |
+| Built into Kubernetes | Yes | No — installed separately |
+| Scale trigger | CPU / Memory | HTTP requests, SQS queue, Cron, Kafka, etc. |
+| Scale to zero | No (min 1) | Yes — can scale to 0 pods |
+| Best for | General compute load | Event queues, scheduled spikes, HTTP traffic |
+| Works with Argo Rollouts | Yes — targets Rollout resource | Yes — targets Rollout resource |
+
+**Important:** When KEDA is enabled, it creates its own internal HPA. You should use either HPA or KEDA per app — not both simultaneously, unless you use `transfer-hpa-ownership` annotation (already added in templates).
+
+---
+
+### Prerequisites
+
+#### 1. Install Metrics Server (required for HPA)
+
+HPA reads CPU/Memory from the Metrics Server. EKS does not install it by default.
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# Verify
+kubectl get deployment metrics-server -n kube-system
+kubectl top nodes    # should show CPU/Memory usage
+kubectl top pods -n production
+```
+
+#### 2. Install KEDA
+
+```bash
+helm repo add kedacore https://kedacore.github.io/charts
+helm repo update
+
+helm install keda kedacore/keda \
+  --namespace keda \
+  --create-namespace \
+  --wait
+
+# Verify
+kubectl get pods -n keda
+# Expected: keda-operator and keda-operator-metrics-apiserver — Running
+```
+
+#### 3. Install KEDA HTTP Add-on (for HTTP scaler)
+
+The built-in KEDA HTTP scaler requires the HTTP add-on:
+
+```bash
+helm install http-add-on kedacore/keda-add-ons-http \
+  --namespace keda \
+  --wait
+
+# Verify
+kubectl get pods -n keda | grep http
+```
+
+---
+
+### What Was Added to Helm Charts
+
+Two new templates added to both `spring-maven` and `spring-gradle`:
+
+```
+apps/<app>/helm/templates/
+├── hpa.yaml           ← HPA targeting Argo Rollout (CPU/Memory)
+└── scaledobject.yaml  ← KEDA ScaledObject (HTTP / SQS / Cron)
+```
+
+Both are **disabled by default** in `values.yaml` and **enabled in `values-production.yaml`**.
+
+---
+
+### HPA Configuration
+
+**How it works:**
+```
+Metrics Server reads pod CPU/Memory every 15s
+        ↓
+HPA compares actual usage vs target (e.g. 70% CPU)
+        ↓
+If usage > target → add pods (up to maxReplicas)
+If usage < target → remove pods (down to minReplicas)
+        ↓
+Scale-up: fast (30s stabilization, 2 pods at a time)
+Scale-down: slow (180s stabilization, 1 pod at a time) — avoids flapping
+```
+
+**Config in `values.yaml` (disabled) / `values-production.yaml` (enabled):**
+```yaml
+hpa:
+  enabled: true
+  minReplicas: 2          # never go below 2 in production
+  maxReplicas: 10         # never exceed 10
+  targetCPUUtilization: 70     # scale up when avg CPU > 70%
+  targetMemoryUtilization: 80  # scale up when avg Memory > 80%
+```
+
+**Verify HPA is working:**
+```bash
+kubectl get hpa -n production
+# NAME            REFERENCE                    TARGETS         MINPODS   MAXPODS   REPLICAS
+# spring-maven    Rollout/spring-maven         45%/70%         2         10        2
+
+kubectl describe hpa spring-maven -n production
+# Shows scaling events, current/desired replicas, conditions
+```
+
+**Load test to trigger HPA:**
+```bash
+# Install hey (HTTP load generator)
+brew install hey
+
+# Hit the app with 200 concurrent requests
+hey -n 10000 -c 200 https://spring-maven.devopscab.com/api/health
+
+# Watch HPA react in real time
+kubectl get hpa spring-maven -n production -w
+```
+
+---
+
+### KEDA Configuration
+
+KEDA supports multiple scalers — you can enable any combination in `values-production.yaml`.
+
+#### Scaler 1 — HTTP Request Rate
+
+Scales based on requests per second hitting the app.
+
+```yaml
+keda:
+  enabled: true
+  http:
+    enabled: true
+    hosts:
+      - spring-maven.devopscab.com
+    targetRequestsPerSecond: "100"  # 1 pod per 100 req/sec
+```
+
+Example: If 350 req/sec → scales to 4 pods. If drops to 50 req/sec → scales back to 1.
+
+#### Scaler 2 — AWS SQS Queue
+
+Scales based on messages waiting in an SQS queue. Ideal for async job processing.
+
+```yaml
+keda:
+  enabled: true
+  sqs:
+    enabled: true
+    queueURL: https://sqs.us-east-1.amazonaws.com/497041484428/my-queue
+    targetQueueLength: "10"   # 1 pod per 10 messages
+    region: us-east-1
+```
+
+Example: Queue has 50 messages → scales to 5 pods. Queue empty → scales to 0 pods.
+
+> **IAM required:** Pod needs `sqs:GetQueueAttributes` permission via IRSA.
+
+#### Scaler 3 — Cron (Scheduled Scaling)
+
+Pre-scales to a fixed replica count on a schedule — before expected traffic spikes.
+
+```yaml
+keda:
+  enabled: true
+  cron:
+    enabled: true
+    timezone: Asia/Kolkata
+    start: "0 8 * * 1-5"     # Mon-Fri 8am IST → scale up
+    end: "0 20 * * 1-5"      # Mon-Fri 8pm IST → scale down
+    desiredReplicas: "3"      # run 3 pods during business hours
+```
+
+**Verify KEDA ScaledObject:**
+```bash
+kubectl get scaledobject -n production
+# NAME            SCALETARGETKIND   SCALETARGETNAME   MIN   MAX   READY   ACTIVE
+# spring-maven    Rollout           spring-maven       2     10    True    True
+
+kubectl describe scaledobject spring-maven -n production
+```
+
+---
+
+### HPA + KEDA with Blue-Green (Argo Rollouts)
+
+Both HPA and KEDA target the **Rollout** resource (not a Deployment). During a Blue-Green deployment:
+
+```
+Blue-Green promotion in progress:
+  Blue Rollout  ← HPA/KEDA managing this (active)
+  Green Rollout ← previewReplicaCount: 1 (fixed during testing)
+
+After promotion:
+  Green becomes active → HPA/KEDA immediately manages the new active ReplicaSet
+  Blue scales down after scaleDownDelaySeconds (30s)
+```
+
+The autoscaler seamlessly follows the active ReplicaSet through promotions — no manual intervention needed.
+
+---
+
+### Environment Strategy
+
+| Environment | HPA | KEDA | Min Replicas | Max Replicas |
+|---|---|---|---|---|
+| Staging | Disabled | Disabled | 1 (fixed) | 1 (fixed) |
+| Production | Enabled | Enabled (HTTP + Cron) | 2 | 10 |
+
+Staging uses fixed replicas to save cost and keep deployments predictable. Production uses both HPA and KEDA.
+
+---
+
+### Scaling Decision Flow
+
+```
+Traffic hits spring-maven.devopscab.com
+        │
+        ├── KEDA HTTP scaler checks req/sec every 30s
+        │     > 100 req/sec → requests more replicas
+        │
+        ├── HPA checks CPU/Memory every 15s
+        │     > 70% CPU → requests more replicas
+        │
+        └── Kubernetes scheduler picks the higher replica count
+              and adds/removes pods accordingly
+```
+
+---
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| HPA shows `<unknown>/70%` for targets | Metrics Server not installed | `kubectl apply -f metrics-server manifest` |
+| HPA not scaling up | CPU requests not set in pod spec | Ensure `resources.requests.cpu` is set in values.yaml |
+| KEDA ScaledObject shows `READY: False` | KEDA operator not running | `kubectl get pods -n keda` |
+| HTTP scaler not working | HTTP add-on not installed | `helm install http-add-on kedacore/keda-add-ons-http -n keda` |
+| SQS scaler auth error | Pod missing IAM permissions | Add `sqs:GetQueueAttributes` to pod's IAM role via IRSA |
+| Pods not scaling during Blue-Green | HPA targeting wrong resource | Confirm `scaleTargetRef.kind: Rollout` in hpa.yaml |
+| Scale-down too aggressive | Default stabilization too short | Increase `scaleDown.stabilizationWindowSeconds` in hpa.yaml |

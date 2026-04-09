@@ -38,3 +38,43 @@ blueGreen:
   scaleDownDelaySeconds: 30     # keep old blue pods 30s after promotion — allows instant rollback
   previewReplicaCount: 1        # number of green pods to spin up for preview
   abortScaleDownDelaySeconds: 30  # scale down failed green pods 30s after abort
+
+# ── HPA (CPU/Memory based autoscaling) ───────────────────────────
+# Disabled by default — override in values-production.yaml
+hpa:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilization: 70      # scale up when CPU > 70%
+  targetMemoryUtilization: 80   # scale up when Memory > 80%
+
+# ── KEDA (Event-driven autoscaling) ──────────────────────────────
+# Disabled by default — enable specific scalers in values-production.yaml
+keda:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  pollingInterval: 30           # check metrics every 30 seconds
+  cooldownPeriod: 120           # wait 120s before scaling down
+
+  # HTTP Request Rate scaler — scale on incoming requests/sec
+  http:
+    enabled: false
+    hosts:
+      - spring-maven.devopscab.com
+    targetRequestsPerSecond: "100"  # scale up when > 100 req/sec
+
+  # AWS SQS scaler — scale on queue depth
+  sqs:
+    enabled: false
+    queueURL: ""                    # set in values-production.yaml
+    targetQueueLength: "10"         # 1 pod per 10 messages in queue
+    region: us-east-1
+
+  # Cron scaler — pre-scale on a schedule
+  cron:
+    enabled: false
+    timezone: Asia/Kolkata
+    start: "0 8 * * 1-5"           # scale up Mon-Fri 8am IST
+    end: "0 20 * * 1-5"            # scale down Mon-Fri 8pm IST
+    desiredReplicas: "3"            # run 3 pods during business hours
