@@ -41,6 +41,14 @@ End-to-end setup for two Spring Boot applications (Maven + Gradle) with a 9-stag
     - [Key Commands Reference](#argocd-key-commands-reference)
     - [Kind vs EKS Differences](#difference-kind-cluster-vs-eks)
     - [Troubleshooting](#troubleshooting-argocd-on-eks)
+26. [Onboarding a New Application to GitOps](#26-onboarding-a-new-application-to-gitops)
+    - [What Is Manual vs Automatic](#what-is-manual-vs-automatic)
+    - [Step 1 — Create Helm Chart](#step-1--create-helm-chart-in-spring-gitops)
+    - [Step 2 — Create ArgoCD Manifests](#step-2--create-argocd-application-manifests)
+    - [Step 3 — Register with ArgoCD](#step-3--register-apps-with-argocd-once)
+    - [Step 4 — Add CI GitOps Update Step](#step-4--add-gitops-update-step-to-app-ci-pipeline)
+    - [Full Lifecycle After Setup](#full-lifecycle-after-setup)
+    - [Onboarding Checklist](#checklist--new-application-onboarding)
 
 ---
 
@@ -2641,3 +2649,402 @@ Or via **UI**: Settings → Repositories → Connect Repo
 | ArgoCD UI not accessible | ELB still provisioning | Wait 60–90s after `kubectl patch svc` |
 | `ImagePullBackOff` on Green | Wrong image tag in values.yaml | Fix tag in spring-gitops → ArgoCD re-syncs |
 | Old Blue pods not scaling down | `scaleDownDelaySeconds` in progress | Wait 30s — or check `kubectl get rs -n production` |
+
+---
+
+## 26. Onboarding a New Application to GitOps
+
+When you build a brand new application and want to deploy it via ArgoCD + Blue-Green, the **Helm chart and ArgoCD manifests must be created manually once**. After that, CI takes over automatically on every build.
+
+---
+
+### What Is Manual vs Automatic
+
+```
+NEW APPLICATION — one-time manual setup required:
+
+  Developer creates new app repo (e.g. school-api)
+        │
+        ▼ ── MANUAL (done once) ──────────────────────────────
+  1. Create Helm chart folder in spring-gitops
+  2. Create ArgoCD Application manifests in spring-gitops
+  3. Register apps with ArgoCD (kubectl apply)
+  4. Add gitops update step to the app's CI pipeline
+        │
+        ▼ ── AUTOMATIC (every push from this point on) ───────
+  5. Developer pushes code → CI builds image → updates image
+     tag in values.yaml → pushes to spring-gitops → ArgoCD
+     detects change → deploys new Green version automatically
+```
+
+**Why it can't be fully automatic:**
+The CI pipeline only updates a values.yaml that already exists. It has no logic to create a new app folder from scratch. Someone must create the Helm chart and register the app with ArgoCD once.
+
+---
+
+### Step 1 — Create Helm Chart in spring-gitops
+
+Create the following folder structure in the `spring-gitops` repo:
+
+```
+apps/<app-name>/helm/
+├── Chart.yaml
+├── values.yaml               ← image tag lives here — CI updates this
+├── values-staging.yaml       ← staging-specific overrides
+├── values-production.yaml    ← production overrides + preview host URL
+└── templates/
+    ├── rollout.yaml          ← Blue-Green Rollout (replaces Deployment)
+    ├── service.yaml          ← active service (Blue — production traffic)
+    ├── service-preview.yaml  ← preview service (Green — testing only)
+    └── ingress.yaml          ← ALB Ingress with active + preview hosts
+```
+
+**`Chart.yaml`** — chart metadata:
+```yaml
+apiVersion: v2
+name: <app-name>
+description: Helm chart for <app-name>
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+```
+
+**`values.yaml`** — base config (CI updates `image.tag` here):
+```yaml
+image:
+  repository: <dockerhub-username>/<app-name>
+  tag: latest          # CI replaces this on every build
+  pullPolicy: Always
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+livenessProbe:
+  path: /api/health
+  initialDelaySeconds: 60
+  periodSeconds: 10
+
+readinessProbe:
+  path: /api/health
+  initialDelaySeconds: 45
+  periodSeconds: 5
+
+ingress:
+  host: <app-name>.devopscab.com
+  previewHost: ""
+  certificateArn: arn:aws:acm:us-east-1:497041484428:certificate/<cert-id>
+
+blueGreen:
+  autoPromotionEnabled: false    # always require manual promotion
+  scaleDownDelaySeconds: 30      # keep Blue 30s after promotion
+  previewReplicaCount: 1         # Green runs 1 pod during testing
+  abortScaleDownDelaySeconds: 30
+```
+
+**`values-staging.yaml`** — staging overrides:
+```yaml
+replicaCount: 1
+
+ingress:
+  host: <app-name>-staging.devopscab.com
+  previewHost: ""
+```
+
+**`values-production.yaml`** — production overrides:
+```yaml
+replicaCount: 2
+
+ingress:
+  host: <app-name>.devopscab.com
+  previewHost: <app-name>-preview.devopscab.com  # Green preview URL
+```
+
+---
+
+**`templates/rollout.yaml`** — Blue-Green Rollout:
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: {{ .Release.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.livenessProbe.path }}
+              port: {{ .Values.service.targetPort }}
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.readinessProbe.path }}
+              port: {{ .Values.service.targetPort }}
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+  strategy:
+    blueGreen:
+      activeService: {{ .Release.Name }}          # Blue — live traffic
+      previewService: {{ .Release.Name }}-preview  # Green — testing only
+      autoPromotionEnabled: {{ .Values.blueGreen.autoPromotionEnabled }}
+      scaleDownDelaySeconds: {{ .Values.blueGreen.scaleDownDelaySeconds }}
+      previewReplicaCount: {{ .Values.blueGreen.previewReplicaCount }}
+      abortScaleDownDelaySeconds: {{ .Values.blueGreen.abortScaleDownDelaySeconds }}
+```
+
+**`templates/service.yaml`** — active (Blue) service:
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+```
+
+**`templates/service-preview.yaml`** — preview (Green) service:
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-preview
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+```
+
+**`templates/ingress.yaml`** — ALB Ingress with active + preview hosts:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/certificate-arn: {{ .Values.ingress.certificateArn }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+spec:
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}
+                port:
+                  number: {{ .Values.service.port }}
+    {{- if .Values.ingress.previewHost }}
+    - host: {{ .Values.ingress.previewHost }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-preview
+                port:
+                  number: {{ .Values.service.port }}
+    {{- end }}
+```
+
+---
+
+### Step 2 — Create ArgoCD Application Manifests
+
+Create two files in the `argocd/` folder of `spring-gitops`:
+
+**`argocd/<app-name>-staging.yaml`** — auto-deploys on every push:
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: <app-name>-staging
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/dhanrajsr/spring-gitops.git
+    targetRevision: main
+    path: apps/<app-name>/helm
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-staging.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+**`argocd/<app-name>-production.yaml`** — manual promotion required:
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: <app-name>-production
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/dhanrajsr/spring-gitops.git
+    targetRevision: main
+    path: apps/<app-name>/helm
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-production.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+    # No automated sync — manual approval required in ArgoCD UI
+```
+
+---
+
+### Step 3 — Register Apps with ArgoCD (Once)
+
+```bash
+kubectl apply -f argocd/<app-name>-staging.yaml
+kubectl apply -f argocd/<app-name>-production.yaml
+
+# Verify they appear in ArgoCD
+kubectl get applications -n argocd
+```
+
+In the ArgoCD UI you will now see the new apps. Click **Sync** on staging to deploy the first version.
+
+---
+
+### Step 4 — Add GitOps Update Step to App CI Pipeline
+
+In the app's GitHub Actions CI workflow (e.g. `.github/workflows/ci.yml`), add this step after the Docker push step:
+
+```yaml
+- name: Checkout spring-gitops repo
+  uses: actions/checkout@v4
+  with:
+    repository: dhanrajsr/spring-gitops
+    token: ${{ secrets.GITOPS_PAT }}
+    path: spring-gitops
+
+- name: Update image tag in GitOps repo
+  run: |
+    sed -i "s/tag:.*/tag: ${{ github.sha }}/" \
+      spring-gitops/apps/<app-name>/helm/values.yaml
+    cd spring-gitops
+    git config user.name "github-actions"
+    git config user.email "github-actions@github.com"
+    git add apps/<app-name>/helm/values.yaml
+    git commit -m "ci(<app-name>): update image tag to ${{ github.sha }}"
+    git push
+```
+
+> **Secret required:** `GITOPS_PAT` — a GitHub Personal Access Token with `repo` scope, set in the app repo's secrets.
+> ```bash
+> gh secret set GITOPS_PAT --body "<pat-token>" --repo dhanrajsr/<app-name>
+> ```
+
+---
+
+### Full Lifecycle After Setup
+
+Once Steps 1–4 are done, this happens automatically on every code push:
+
+```
+Developer pushes code
+        ↓
+CI: build → test → docker push (new image)
+        ↓
+CI: update apps/<app-name>/helm/values.yaml (image.tag = <sha>)
+        ↓
+CI: git push to spring-gitops
+        ↓
+ArgoCD: detects values.yaml changed → marks app OutOfSync
+        ↓
+Staging: auto-syncs → Green pods deploy → Blue-Green promotion
+         happens automatically (autoPromotionEnabled: true for staging)
+        ↓
+Production: shows OutOfSync in UI → you click Sync → Green deploys
+            → you test preview URL → you click Promote → traffic switches
+```
+
+---
+
+### Checklist — New Application Onboarding
+
+```
+□ Create apps/<app-name>/helm/Chart.yaml
+□ Create apps/<app-name>/helm/values.yaml
+□ Create apps/<app-name>/helm/values-staging.yaml
+□ Create apps/<app-name>/helm/values-production.yaml
+□ Create apps/<app-name>/helm/templates/rollout.yaml
+□ Create apps/<app-name>/helm/templates/service.yaml
+□ Create apps/<app-name>/helm/templates/service-preview.yaml
+□ Create apps/<app-name>/helm/templates/ingress.yaml
+□ Create argocd/<app-name>-staging.yaml
+□ Create argocd/<app-name>-production.yaml
+□ kubectl apply -f argocd/<app-name>-staging.yaml
+□ kubectl apply -f argocd/<app-name>-production.yaml
+□ Add gitops update step to app CI pipeline
+□ Set GITOPS_PAT secret in app repo
+□ Push a commit → verify ArgoCD detects and deploys
+```
