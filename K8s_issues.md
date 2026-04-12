@@ -1,655 +1,770 @@
-# Kubernetes Issues — Diagnosis & Fix Playbook
+# Kubernetes Issues — Plain English Guide
 
-A practical reference for diagnosing and resolving the most common Kubernetes issues in production.
+> Think of Kubernetes like a restaurant kitchen.
+> - **Node** = a chef's workstation
+> - **Pod** = a dish being prepared
+> - **Container** = the actual cooking happening inside the dish
+> - **Service** = the waiter who delivers the dish to the right table
+> - **Deployment** = the recipe that says how many dishes to make
 
 ---
 
-## Universal First Steps — Always Start Here
+## Where to Start — Every Single Time
 
-Every time something is wrong, run these 3 commands first:
+Before anything else, run these 3 commands. They answer:
+- **What is broken?**
+- **Why is it broken?**
+- **What did the app say before it died?**
 
 ```bash
-# Step 1 — Get the big picture (find all non-running pods)
+# 1. Show me everything that is NOT running
 kubectl get pods -A | grep -v Running | grep -v Completed
 
-# Step 2 — Find the root cause
+# 2. Show me full details of the broken pod
 kubectl describe pod <pod-name> -n <namespace>
 
-# Step 3 — Read the logs
+# 3. Show me the last logs before it crashed
 kubectl logs <pod-name> -n <namespace> --previous
 ```
 
 ---
 
-## Quick Reference — Diagnosis Decision Tree
+# Issue 1 — CrashLoopBackOff
 
-```
-Pod not working?
-│
-├── kubectl get pods → what STATUS?
-│
-├── CrashLoopBackOff ──► kubectl logs --previous + describe (exit code)
-├── OOMKilled        ──► kubectl top pod + increase memory limit
-├── ImagePullBackOff ──► describe → check image name + registry secret
-├── Pending          ──► describe → node capacity or selector mismatch
-├── Init:0/1         ──► kubectl logs -c <init-container-name>
-│
-├── Running but app fails?
-│   ├── kubectl get endpoints <svc> → empty = label mismatch
-│   ├── kubectl run test-pod → curl service → DNS issue?
-│   └── kubectl top pod → at CPU limit = throttling
-│
-└── In New Relic:
-    ├── Infrastructure → Kubernetes → check red pods
-    ├── APM → high response time = slow endpoint or throttling
-    ├── Logs → filter level=error → find stack trace
-    └── Alerts → Issues → which condition fired + which pod
-```
+## What Is Happening?
 
----
+Imagine you hired a new chef (your app). The chef walks in, tries to start cooking, something goes wrong, and they walk out. You call them back. They walk in again, same thing happens. Over and over.
 
-# Category 1 — Pod Failures
+That is CrashLoopBackOff — **your app keeps starting and crashing, over and over again.**
 
----
+Kubernetes waits longer each time before restarting:
+- 1st crash → wait 10 seconds
+- 2nd crash → wait 20 seconds
+- 3rd crash → wait 40 seconds
+- After many crashes → wait 5 minutes
 
-## Issue 1 — CrashLoopBackOff
-
-**What it means:** Pod starts, crashes, Kubernetes restarts it, crashes again.
-Backoff timer grows: 10s → 20s → 40s → 5min.
-
-### Diagnose
+## How to Spot It
 
 ```bash
-# Step 1 — Confirm
 kubectl get pods -n <namespace>
-# NAME                    READY   STATUS             RESTARTS
-# my-app-xxx              0/1     CrashLoopBackOff   6
-
-# Step 2 — Check exit code (tells you WHY it crashed)
-kubectl describe pod <pod-name> -n <namespace>
-# Look for:
-#   Last State: Terminated
-#   Exit Code: 1    ← app error
-#   Exit Code: 137  ← OOMKilled (memory exceeded)
-#   Exit Code: 139  ← Segfault
-
-# Step 3 — Read crash logs from PREVIOUS run (not current)
-kubectl logs <pod-name> -n <namespace> --previous
-
-# Step 4 — Check Kubernetes events
-kubectl describe pod <pod-name> -n <namespace> | grep -A20 Events
 ```
 
-### In New Relic
-> Infrastructure → Kubernetes → Pods → click the pod → check Exit Code + View logs
-
-### Fix by Exit Code
-
-| Exit Code | Cause | Fix |
-|---|---|---|
-| 1 | App error at startup | Check logs — missing env var, DB unreachable |
-| 137 | OOMKilled | Increase memory limit |
-| 139 | Segfault | Bug in app or wrong base image |
-
-```yaml
-# Fix — increase memory limit in deployment
-resources:
-  requests:
-    memory: "256Mi"
-  limits:
-    memory: "512Mi"   # increase this
 ```
+NAME                READY   STATUS              RESTARTS   AGE
+my-app-xxx          0/1     CrashLoopBackOff    6          15m
+```
+
+- `0/1` → pod is NOT ready (0 containers running out of 1)
+- `CrashLoopBackOff` → crashing and restarting
+- `RESTARTS: 6` → already crashed 6 times
+
+## How to Find the Cause
 
 ```bash
-# Restart after fix
+# Step 1 — Find the exit code (tells you WHY it crashed)
+kubectl describe pod my-app-xxx -n <namespace>
+```
+
+Look for this section in the output:
+```
+Last State: Terminated
+  Reason:    Error
+  Exit Code: 1        ← this number tells you the reason
+```
+
+**Exit Code meaning:**
+- `Exit Code: 1`   → The app itself crashed (code bug, wrong config, DB not reachable)
+- `Exit Code: 137` → App was killed because it used too much memory
+- `Exit Code: 139` → App hit a fatal code error (segfault)
+
+```bash
+# Step 2 — Read the actual crash message
+# Use --previous to see logs from the LAST run (not current)
+kubectl logs my-app-xxx -n <namespace> --previous
+```
+
+## Common Causes and Fix
+
+| Cause | What logs say | Fix |
+|---|---|---|
+| DB not reachable | `Connection refused: postgres:5432` | Check DB pod is running |
+| Missing config | `Environment variable DB_HOST not set` | Add the missing env var |
+| App code bug | `NullPointerException` or `Error: cannot read property` | Fix the bug, redeploy |
+| Wrong startup command | `bash: myapp: command not found` | Fix the command in deployment |
+
+```bash
+# Fix — restart the deployment after fixing the issue
 kubectl rollout restart deployment <name> -n <namespace>
 ```
 
 ---
 
-## Issue 2 — OOMKilled
+# Issue 2 — OOMKilled
 
-**What it means:** App used more memory than its limit. Kubernetes killed it silently.
-Pod shows Running → suddenly gone → CrashLoopBackOff.
+## What Is Happening?
 
-### Diagnose
+Your app is like a chef working at a small table (memory limit). The chef keeps piling up more and more ingredients on the table. When the table overflows, the kitchen manager (Kubernetes) **flips the table and sends the chef home** — that is OOMKilled.
+
+OOM = Out Of Memory. Killed = forcefully terminated.
+
+## How to Spot It
 
 ```bash
-# Step 1 — Check reason (OOMKilled)
-kubectl describe pod <pod-name> -n <namespace>
-# Last State: Terminated
-# Reason:     OOMKilled
-# Exit Code:  137
-
-# Step 2 — Check current memory usage
-kubectl top pod <pod-name> -n <namespace>
-# NAME     CPU   MEMORY
-# my-app   10m   480Mi   ← close to or over limit
-
-# Step 3 — Check what the limit is set to
-kubectl get pod <pod-name> -n <namespace> \
-  -o jsonpath='{.spec.containers[0].resources}'
+kubectl get pods -n <namespace>
 ```
 
-### In New Relic
-> Dashboards → kind-calico-prod → Traffic & Chaos → "Memory Pressure" widget
-> Look for: memory spike → sudden drop to 0 = OOMKill moment
+```
+NAME              READY   STATUS      RESTARTS   AGE
+flask-api-xxx     0/1     OOMKilled   3          20m
+```
 
-### Fix
+OR it shows as CrashLoopBackOff with Exit Code 137:
+```
+Last State: Terminated
+  Reason:    OOMKilled    ← killed by kernel, not by app
+  Exit Code: 137
+```
+
+## How to Find the Cause
 
 ```bash
-# Option 1 — increase memory limit via kubectl
-kubectl set resources deployment <name> -n <namespace> \
-  --limits=memory=1Gi --requests=memory=512Mi
+# See how much memory the pod is using right now
+kubectl top pod <pod-name> -n <namespace>
+```
 
-# Option 2 — edit deployment YAML
-kubectl edit deployment <name> -n <namespace>
-# Update: limits.memory: 1Gi
+```
+NAME          CPU   MEMORY
+flask-api-xxx  45m   251Mi   ← using 251Mi
+```
 
-# Option 3 — find memory leak via APM
-# APM → Transactions → find endpoint that causes memory spike
+Then check what the limit is:
+```bash
+kubectl describe pod <pod-name> -n <namespace>
+```
+
+```
+Limits:
+  memory: 256Mi    ← limit is 256Mi, pod uses 251Mi = about to be killed
+```
+
+## Fix
+
+```yaml
+# In your deployment YAML, increase the memory limit
+resources:
+  requests:
+    memory: "256Mi"   # minimum memory guaranteed
+  limits:
+    memory: "512Mi"   # maximum allowed — increase this
+```
+
+```bash
+# Apply and restart
+kubectl rollout restart deployment <name> -n <namespace>
 ```
 
 ---
 
-## Issue 3 — ImagePullBackOff
+# Issue 3 — ImagePullBackOff
 
-**What it means:** Kubernetes cannot pull the container image from the registry.
+## What Is Happening?
 
-### Diagnose
+Before your app can run, Kubernetes needs to download the app's Docker image (like downloading software). If it cannot find the image or is not allowed to download it — the pod never starts.
+
+Think of it like: you ordered food but gave the wrong delivery address. The delivery person keeps trying and failing.
+
+## How to Spot It
 
 ```bash
-# Step 1 — Confirm
 kubectl get pods -n <namespace>
-# NAME      READY   STATUS             RESTARTS
-# my-app    0/1     ImagePullBackOff   0
-
-# Step 2 — Find the exact error
-kubectl describe pod <pod-name> -n <namespace>
-# Events:
-#   Failed to pull image "myrepo/myapp:v1.2":
-#   unauthorized: authentication required  ← missing registry secret
-#   not found                              ← wrong image name or tag
-
-# Step 3 — Test manually
-docker pull myrepo/myapp:v1.2
 ```
 
-### Fix
+```
+NAME          READY   STATUS             RESTARTS   AGE
+my-app-xxx    0/1     ImagePullBackOff   0          3m
+```
+
+## How to Find the Cause
 
 ```bash
-# Fix 1 — Wrong image name or tag
-kubectl set image deployment/<name> <container>=myrepo/myapp:v1.3 -n <namespace>
+kubectl describe pod my-app-xxx -n <namespace>
+```
 
-# Fix 2 — Private registry — create image pull secret
-kubectl create secret docker-registry regcred \
+Look at the **Events** section at the bottom:
+```
+Events:
+  Warning  Failed  2m  kubelet  Failed to pull image "myrepo/myapp:v2.1":
+                                unauthorized: authentication required
+                                ← this means: registry needs a password
+```
+
+**Other error messages and what they mean:**
+- `not found` → you typed the wrong image name or wrong version tag
+- `unauthorized` → you have no permission to pull from this registry
+- `connection refused` → the registry URL is wrong
+
+## Fix
+
+```bash
+# Fix 1 — Typo in image name, correct it
+kubectl set image deployment/<name> <container>=myrepo/myapp:v2.1 -n <namespace>
+
+# Fix 2 — Private registry needs credentials
+# Create a secret with your registry login
+kubectl create secret docker-registry my-registry-secret \
   --docker-server=myrepo.example.com \
   --docker-username=myuser \
   --docker-password=mypassword \
   -n <namespace>
 
-# Attach secret to deployment
+# Tell the deployment to use this secret
 kubectl patch deployment <name> -n <namespace> \
-  -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"regcred"}]}}}}'
+  -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"my-registry-secret"}]}}}}'
 ```
 
 ---
 
-## Issue 4 — Pod Stuck in Pending
+# Issue 4 — Pod Stuck in Pending
 
-**What it means:** Pod was created but no node could schedule it.
+## What Is Happening?
 
-### Diagnose
+Your pod is created but **no server (node) can take it**. It is like a new customer arriving at a restaurant but every table is full — they just wait at the door.
+
+The pod has not even started yet. It is just waiting for a spot.
+
+## How to Spot It
 
 ```bash
-# Step 1 — Confirm pending
 kubectl get pods -n <namespace>
-# NAME      READY   STATUS    RESTARTS
-# my-app    0/1     Pending   0
+```
 
-# Step 2 — THIS is the key command for Pending pods
+```
+NAME              READY   STATUS    RESTARTS   AGE
+api-server-xxx    0/1     Pending   0          10m
+                                               ← waiting for 10 minutes = problem
+```
+
+Note: `RESTARTS: 0` — the app never even started once.
+
+## How to Find the Cause
+
+```bash
+# This is the MOST important command for Pending pods
 kubectl describe pod <pod-name> -n <namespace>
-# Events:
-#   0/4 nodes are available:
-#   4 Insufficient memory       ← nodes full
-#   4 Insufficient cpu          ← nodes full
-#   4 node(s) didn't match node selector  ← wrong label
-
-# Step 3 — Check node capacity
-kubectl describe nodes | grep -A5 "Allocated resources"
-# If cpu: 95%, memory: 89% → nodes are full
-
-# Step 4 — Check pod resource requests
-kubectl get pod <pod-name> -n <namespace> \
-  -o jsonpath='{.spec.containers[0].resources}'
 ```
 
-### Fix
+Look at the **Events** section at the bottom:
+```
+Events:
+  Warning  FailedScheduling  30s  scheduler
+           0/4 nodes are available:
+           4 Insufficient memory.    ← all 4 nodes are out of memory
+           4 Insufficient cpu.       ← all 4 nodes are out of CPU
+```
+
+OR:
+```
+           node(s) didn't match node selector   ← pod needs specific node labels that don't exist
+```
+
+## Fix
 
 ```bash
-# Fix 1 — Nodes full, reduce requests
-kubectl edit deployment <name> -n <namespace>
-# Lower: requests.cpu and requests.memory
+# Check how full your nodes are
+kubectl describe nodes | grep -A5 "Allocated resources"
+```
 
-# Fix 2 — Wrong node selector, check available labels
-kubectl get nodes --show-labels
-# Update deployment nodeSelector to match actual node labels
-
-# Fix 3 — Add more nodes (cloud)
-# EKS: increase node group desired capacity
-# Kind: add more worker nodes
+```
+# If nodes are full — reduce what the pod asks for:
+resources:
+  requests:
+    cpu: "100m"      ← lower this (was 500m)
+    memory: "128Mi"  ← lower this (was 512Mi)
 ```
 
 ---
 
-## Issue 5 — Init Container Failing
+# Issue 5 — Init Container Failing
 
-**What it means:** Init container runs before the main app. If it fails, main app never starts.
+## What Is Happening?
 
-### Diagnose
+Some pods have a "setup step" that runs before the main app. This is called an init container. Think of it like a prep cook who sets up the kitchen before the main chef arrives.
+
+If the prep cook fails — the main chef never comes in. The pod stays stuck forever.
+
+## How to Spot It
 
 ```bash
-# Step 1 — Spot it
 kubectl get pods -n <namespace>
-# NAME      READY   STATUS     RESTARTS
-# my-app    0/1     Init:0/1   0
+```
 
-# Step 2 — Find the init container name
-kubectl describe pod <pod-name> -n <namespace> | grep -A10 "Init Containers"
+```
+NAME          READY   STATUS     RESTARTS   AGE
+web-app-xxx   0/1     Init:0/1   3          8m
+                      ^^^^^^^^
+                      ← stuck in init step (0 of 1 init containers done)
+```
 
-# Step 3 — Check init container logs specifically
+## How to Find the Cause
+
+```bash
+# Step 1 — Find the init container name
+kubectl describe pod <pod-name> -n <namespace>
+# Look for "Init Containers:" section → note the name
+
+# Step 2 — Read the init container logs (specify with -c flag)
 kubectl logs <pod-name> -n <namespace> -c <init-container-name>
 ```
 
-### Common Causes & Fixes
+```
+# Common output:
+Waiting for database at postgres-svc:5432...
+Attempt 1: failed to connect
+Attempt 2: failed to connect
+...
+Giving up after 30 attempts   ← init failed because DB is not running
+```
+
+## Fix
 
 ```bash
-# Cause 1 — Waiting for DB that's not ready
-# Check if DB is running first
+# Check if the dependency (DB) is actually running
 kubectl get pods -n <namespace> | grep db
-kubectl logs <db-pod> -n <namespace>
+kubectl logs <db-pod-name> -n <namespace>
 
-# Cause 2 — Script error (missing command, wrong path)
-# Check the init container command in describe output
-
-# Cause 3 — Wrong volume mount permissions
-kubectl exec <pod-name> -n <namespace> -c <init-container> -- ls -la /mount/path
+# Fix the DB first, then the init container will pass automatically
 ```
 
 ---
 
-# Category 2 — Networking Issues
+# Issue 6 — Service Not Reachable
 
----
+## What Is Happening?
 
-## Issue 6 — Service Not Reachable
+In Kubernetes, a Service acts like a phone operator — it routes calls to the right pod. If the service cannot find any pods to route to, all calls fail.
 
-**What it means:** App is running but requests fail with "Connection refused" or timeout.
+The most common reason: **the service is looking for pods with label `app=frontend` but the pods have label `app=web-frontend`** — a small typo causes complete failure.
 
-### Diagnose
+## How to Spot It
 
 ```bash
-# Step 1 — Check if service exists
-kubectl get svc -n <namespace>
-
-# Step 2 — Check endpoints (THIS is the most important check)
+# Check if the service has any pods behind it
 kubectl get endpoints <service-name> -n <namespace>
-# If output: <none>  ← NO pods match the selector = root cause
-
-# Step 3 — Compare service selector vs pod labels
-kubectl describe svc <service-name> -n <namespace>
-# Selector: app=myapp   ← service expects this label
-
-kubectl get pods -n <namespace> --show-labels
-# Check if any pod actually has: app=myapp
-
-# Step 4 — Test connectivity from inside cluster
-kubectl run test-pod --image=curlimages/curl -it --rm -- \
-  curl http://<service-name>.<namespace>.svc.cluster.local
 ```
 
-### Fix
+```
+NAME           ENDPOINTS   AGE
+frontend-svc   <none>      5d
+               ^^^^^^
+               ← <none> means zero pods are connected to this service
+               ← all traffic to this service will fail
+```
+
+## How to Find the Cause
 
 ```bash
-# Fix mismatched label — update service selector
-kubectl patch svc <service-name> -n <namespace> \
-  -p '{"spec":{"selector":{"app":"correct-label-value"}}}'
+# Step 1 — See what label the service is looking for
+kubectl describe svc <service-name> -n <namespace>
+```
 
-# Or fix the pod labels to match the service
-kubectl label pod <pod-name> -n <namespace> app=myapp
+```
+Selector: app=frontend    ← service expects pods with this label
+```
+
+```bash
+# Step 2 — See what labels the pods actually have
+kubectl get pods -n <namespace> --show-labels
+```
+
+```
+NAME               LABELS
+frontend-xxx       app=web-frontend   ← POD has this label
+                   ^^^^^^^^^^^^^^^^
+                   ← "web-frontend" ≠ "frontend"  ← MISMATCH = root cause
+```
+
+## Fix
+
+```bash
+# Fix the service selector to match the pod label
+kubectl patch svc <service-name> -n <namespace> \
+  -p '{"spec":{"selector":{"app":"web-frontend"}}}'
 ```
 
 ---
 
-## Issue 7 — DNS Resolution Failure
+# Issue 7 — DNS Resolution Failure
 
-**What it means:** App says "could not resolve host". DNS inside the cluster is broken.
+## What Is Happening?
 
-### Diagnose
+Every service in Kubernetes has a name (like a website URL). When your app tries to call another service by name, it uses DNS to find the correct IP address.
+
+If DNS is broken — the app cannot find any other service. It is like trying to call someone but the phone book is missing.
+
+## How to Spot It
+
+App logs will say:
+```
+Error: getaddrinfo ENOTFOUND frontend-svc
+Error: Could not resolve host: postgres-svc
+Error: Name or service not known
+```
+
+## How to Find the Cause
 
 ```bash
-# Step 1 — Test DNS from inside a pod
+# Test DNS from inside the cluster
 kubectl run dns-test --image=busybox --rm -it -- \
   nslookup kubernetes.default.svc.cluster.local
-# If this fails — CoreDNS is broken
 
-# Step 2 — Check CoreDNS pods
+# If this fails → CoreDNS is broken
+# Check CoreDNS pods
 kubectl get pods -n kube-system | grep coredns
-# Should be Running
-
-# Step 3 — Check CoreDNS logs
-kubectl logs -n kube-system -l k8s-app=kube-dns
-
-# Step 4 — Verify correct DNS format
-# Format:  <service>.<namespace>.svc.cluster.local
-# Wrong:   frontend-svc                          ← only works in same namespace
-# Correct: frontend-svc.frontend.svc.cluster.local  ← cross-namespace
 ```
 
-### Fix
+**Most common mistake — wrong service DNS name format:**
+
+```
+# WRONG — only works within the same namespace
+http://frontend-svc
+
+# WRONG — missing namespace
+http://frontend-svc.svc.cluster.local
+
+# CORRECT — full name, works from any namespace
+http://frontend-svc.frontend.svc.cluster.local
+#            ↑service  ↑namespace  ↑domain
+```
+
+## Fix
 
 ```bash
-# Fix 1 — CoreDNS crashing, restart it
+# If CoreDNS is crashing, restart it
 kubectl rollout restart deployment coredns -n kube-system
 
-# Fix 2 — App using wrong hostname
-kubectl set env deployment/<app> -n <namespace> \
+# If the app is using wrong hostname, update the env var
+kubectl set env deployment/<app-name> -n <namespace> \
   DB_HOST=postgres-svc.database.svc.cluster.local
 ```
 
 ---
 
-## Issue 8 — Ingress Not Routing (404 / 502)
+# Issue 8 — Ingress Not Routing (404 or 502 Error)
 
-**What it means:** Browser hits the URL, gets 404 or 502. Traffic is not reaching the pod.
+## What Is Happening?
 
-### Diagnose
+Ingress is the front door of your application — it receives traffic from the internet and sends it to the right service. When it does not work:
+- **404** = the door exists but the room behind it does not
+- **502** = the room exists but the person inside is not responding
+
+## How to Spot It
 
 ```bash
-# Step 1 — Check ingress exists and has an address
 kubectl get ingress -n <namespace>
-# ADDRESS column must have an IP — if empty, controller not working
-
-# Step 2 — Check ingress rules
-kubectl describe ingress <ingress-name> -n <namespace>
-# Rules: host=myapp.example.com → service:myapp-svc:80
-# Verify service name and port are correct
-
-# Step 3 — Check ingress controller is running
-kubectl get pods -n ingress-nginx
-
-# Step 4 — Check ingress controller logs
-kubectl logs -n ingress-nginx \
-  -l app.kubernetes.io/name=ingress-nginx --tail=50
-# "upstream not found" → wrong backend service
-# "no backend"         → service has no endpoints
-
-# Step 5 — Test backend service directly (bypass ingress)
-kubectl port-forward svc/<service-name> 8080:80 -n <namespace>
-curl http://localhost:8080
 ```
 
-### Fix by Symptom
+```
+NAME               HOSTS                   ADDRESS   PORTS
+frontend-ingress   myapp.devopscab.com     <none>    80
+                                           ^^^^^^
+                                           ← no IP = ingress controller not installed or broken
+```
 
-| Symptom | Fix |
-|---|---|
-| 404 from browser | Wrong `path` or `host` in Ingress spec |
-| 502 Bad Gateway | Backend pod crashing or wrong `targetPort` |
-| No ADDRESS on ingress | Ingress controller not installed or not running |
+## How to Find the Cause
+
+```bash
+# Check if ingress controller is running
+kubectl get pods -n ingress-nginx
+
+# Read ingress controller logs
+kubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx --tail=30
+```
+
+```
+# 502 error in logs:
+upstream unreachable  ← backend pod is crashing or wrong port
+
+# 404 error in logs:
+no matching rule for path /api/users  ← ingress path rule is missing or wrong
+```
+
+## Fix
+
+| Error | Cause | Fix |
+|---|---|---|
+| 404 | Wrong path or hostname in ingress | Fix the `host` or `path` in ingress YAML |
+| 502 | Backend pod is down or wrong port | Fix the pod issue first, then check `targetPort` |
+| No IP address | Ingress controller missing | Install nginx ingress controller |
+
+```bash
+# Test backend service directly (skip ingress completely)
+kubectl port-forward svc/<service-name> 8080:80 -n <namespace>
+curl http://localhost:8080
+# If this works → problem is in ingress config
+# If this fails → problem is in the backend pod/service
+```
 
 ---
 
-## Issue 9 — Network Policy Blocking Traffic
+# Issue 9 — Network Policy Blocking Traffic
 
-**What it means:** Traffic is blocked between pods due to Calico/NetworkPolicy rules.
+## What Is Happening?
 
-### Diagnose
+Network Policies are like security guards between rooms. If you add a "deny all" policy — no room can talk to any other room.
+
+The tricky part: **the app shows as Running and Healthy, but all requests just time out silently.**
+
+## How to Spot It
 
 ```bash
-# Step 1 — Check if NetworkPolicies exist
-kubectl get networkpolicies -A
-
-# Step 2 — Test connectivity between pods
+# Test connection between two pods
 kubectl exec <source-pod> -n <namespace> -- \
-  curl -v http://<target-service>.<target-namespace>.svc.cluster.local
-
-# Step 3 — Check policy rules
-kubectl describe networkpolicy <policy-name> -n <namespace>
-# Look at: PodSelector, PolicyTypes, Ingress/Egress rules
+  curl -v --max-time 10 http://frontend-svc.frontend.svc.cluster.local
 ```
 
-### Fix
+```
+* Trying 10.96.152.167:80...
+* Connection timed out after 10000ms   ← timeout (not refused)
+```
+
+Timeout = NetworkPolicy is silently dropping packets (not connection refused which would be instant).
+
+## Fix
 
 ```bash
-# Allow traffic between two namespaces
+# Allow traffic from backend to frontend namespace
 cat <<EOF | kubectl apply -f -
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: allow-from-frontend
-  namespace: backend
+  name: allow-from-backend
+  namespace: frontend
 spec:
   podSelector: {}
   ingress:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: frontend
+              kubernetes.io/metadata.name: backend
 EOF
 ```
 
 ---
 
-## Issue 10 — LoadBalancer EXTERNAL-IP Pending
+# Issue 10 — LoadBalancer IP Stays as Pending
 
-**What it means:** Service type LoadBalancer never gets an external IP.
+## What Is Happening?
 
-### Diagnose
+On cloud providers (AWS, GCP), when you create a LoadBalancer service, Kubernetes asks the cloud to create a real Load Balancer and gives you an IP. On local clusters like **Kind or Minikube**, there is no cloud — so the IP never comes.
+
+## How to Spot It
 
 ```bash
 kubectl get svc -n <namespace>
-# NAME       TYPE           CLUSTER-IP   EXTERNAL-IP   PORT(S)
-# my-svc     LoadBalancer   10.96.1.1    <pending>     80:30080/TCP
-
-# This is expected on: Kind, Minikube, bare metal
-# On Kind — use NodePort or port-forward instead
-kubectl port-forward svc/<service-name> 8080:80 -n <namespace>
 ```
 
-### Fix
+```
+NAME       TYPE           CLUSTER-IP    EXTERNAL-IP   PORT(S)
+my-app     LoadBalancer   10.96.45.1    <pending>     80:31234/TCP
+                                        ^^^^^^^^^
+                                        ← waiting forever on Kind/Minikube
+```
+
+## Fix for Kind (Local Cluster)
 
 ```bash
-# Fix for Kind/bare metal — install MetalLB
-kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
-
-# Or change service type to NodePort
-kubectl patch svc <service-name> -n <namespace> \
-  -p '{"spec":{"type":"NodePort"}}'
+# Use port-forward instead to access the service locally
+kubectl port-forward svc/my-app 8080:80 -n <namespace>
+# Now access via: http://localhost:8080
 ```
 
 ---
 
-# Category 3 — Resource Issues
+# Issue 11 — Node NotReady
 
----
+## What Is Happening?
 
-## Issue 11 — Node NotReady
+A node (server) has gone offline or is in trouble. All pods on that node are either evicted (removed) or stuck. Think of it like a chef's entire workstation breaking down.
 
-**What it means:** A node has gone offline. All pods on it are evicted or stuck.
-
-### Diagnose
+## How to Spot It
 
 ```bash
-# Step 1 — Identify NotReady node
 kubectl get nodes
-# NAME              STATUS     ROLES    AGE
-# calico-worker2    NotReady   <none>   5d
-
-# Step 2 — Check node conditions
-kubectl describe node <node-name>
-# Conditions:
-#   DiskPressure:    True  ← disk full
-#   MemoryPressure:  True  ← RAM full
-#   PIDPressure:     True  ← too many processes
-#   Ready:           False
-
-# Step 3 — Check kubelet status on the node
-# (if you have SSH access to the node)
-systemctl status kubelet
-journalctl -u kubelet -n 50
 ```
 
-### Fix
+```
+NAME                      STATUS     ROLES    AGE
+calico-prod-worker        Ready      <none>   72d   ← ✅ healthy
+calico-prod-worker2       NotReady   <none>   72d   ← ⚠️ offline
+calico-prod-worker3       Ready      <none>   72d   ← ✅ healthy
+```
+
+## How to Find the Cause
 
 ```bash
-# Fix disk pressure — clean up old images and logs
-kubectl debug node/<node-name> -it --image=ubuntu -- bash
-# Inside: df -h, du -sh /var/log/*, docker system prune
+kubectl describe node calico-prod-worker2
+```
 
-# Cordon node (stop new pods scheduling on it)
-kubectl cordon <node-name>
+Look for **Conditions** section:
+```
+DiskPressure:    True    ← node disk is full
+MemoryPressure:  True    ← node RAM is full
+Ready:           False   ← node is offline
+```
 
-# Drain node (move all pods off safely)
-kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data
+## Fix
 
-# After fix, uncordon
-kubectl uncordon <node-name>
+```bash
+# Move all pods off this node safely
+kubectl drain calico-prod-worker2 --ignore-daemonsets --delete-emptydir-data
+
+# After fixing the node (clear disk, free memory)
+kubectl uncordon calico-prod-worker2   ← allow pods back on this node
 ```
 
 ---
 
-## Issue 12 — Evicted Pods
+# Issue 12 — Evicted Pods
 
-**What it means:** Kubernetes forcibly removed pods because a node ran out of resources.
+## What Is Happening?
 
-### Diagnose
+When a node runs out of memory or disk, Kubernetes forcefully removes some pods to save the node. These pods show as **Evicted** — they are dead and will not restart on their own.
+
+## How to Spot It
 
 ```bash
-# Step 1 — Find evicted pods
 kubectl get pods -A | grep Evicted
-
-# Step 2 — Check reason for eviction
-kubectl describe pod <evicted-pod> -n <namespace>
-# Message: The node was low on resource: memory
-#          Threshold quantity: 100Mi, available: 50Mi
-
-# Step 3 — Check node pressure
-kubectl describe node <node-name> | grep -A5 Conditions
 ```
 
-### Fix
+```
+NAMESPACE   NAME                   READY   STATUS    AGE
+default     api-server-xxx         0/1     Evicted   2h
+backend     flask-api-xxx          0/1     Evicted   2h
+```
+
+## Fix
 
 ```bash
-# Clean up evicted pods
+# Delete all evicted pods (they don't auto-clean up)
 kubectl get pods -A | grep Evicted | \
   awk '{print "kubectl delete pod " $2 " -n " $1}' | bash
 
-# Fix root cause — set resource limits on all deployments
-# Set requests and limits to prevent one pod from consuming all resources
+# The deployment will create new pods automatically
+# Fix the underlying node issue (disk/memory) to prevent future evictions
 ```
 
 ---
 
-## Issue 13 — CPU Throttling (App Slow, No Alerts)
+# Issue 13 — CPU Throttling (App Is Slow But Looks Healthy)
 
-**This is the most silent killer.** Pod is Running, no errors, but app is slow.
+## What Is Happening?
 
-### Diagnose
+This is the trickiest issue — **no alerts fire, pod shows Running, zero errors — but the app feels slow.**
+
+Think of a chef limited to using only 1 hand. They can do the work but everything takes 3x longer. The chef is not sick (no errors), just limited (throttled).
+
+CPU throttling happens when:
+- Your pod is using 100% of its CPU limit
+- Kubernetes slows it down instead of killing it
+- Response time goes up, but no crashes or errors
+
+## How to Spot It
 
 ```bash
-# Step 1 — Check CPU usage vs limit
 kubectl top pods -n <namespace>
-# NAME     CPU    MEMORY
-# my-app   498m   200Mi  ← almost at 500m limit = throttled
-
-# Step 2 — Check what the limit is
-kubectl get pod <pod-name> -n <namespace> \
-  -o jsonpath='{.spec.containers[0].resources.limits}'
 ```
 
-### In New Relic
-> APM → Transactions → high response time + 0% error rate = throttling signature
-> Dashboards → Traffic & Chaos → CPU Spike Detection → line is flat at limit
+```
+NAME          CPU    MEMORY
+my-app-xxx    499m   180Mi   ← using 499m out of 500m limit (99%)
+```
 
-### Fix
+In New Relic APM:
+```
+/api/orders    response time: 2.8s    error rate: 0%
+/api/health    response time: 2.1s    error rate: 0%
+←── Slow response time + zero errors = classic CPU throttling signature
+```
+
+## Fix
 
 ```yaml
-# Increase or remove CPU limit
+# Increase CPU limit in deployment YAML
 resources:
   requests:
     cpu: "200m"
   limits:
-    cpu: "1000m"   # increase from 500m
+    cpu: "1000m"   ← increase from 500m to 1000m
 ```
 
 ---
 
-## Issue 14 — No Resource Limits Set
+# Issue 14 — No Resource Limits Set
 
-**What it means:** One runaway pod can starve all others on the node.
+## What Is Happening?
 
-### Diagnose
+If a pod has no limits, it can eat up ALL the CPU and memory on the node — starving every other pod on that node.
+
+Like a chef who takes up every single cooking station, leaving no room for others.
+
+## How to Spot It
 
 ```bash
-# Find all pods without limits
-kubectl get pods -A -o json | \
-  python3 -c "
-import json,sys
-pods=json.load(sys.stdin)
-for p in pods['items']:
-  for c in p['spec']['containers']:
-    if not c.get('resources',{}).get('limits'):
-      print(p['metadata']['namespace'], p['metadata']['name'], c['name'])
-"
+kubectl describe pod <pod-name> -n <namespace>
 ```
 
-### Fix
+```
+Limits:   <none>    ← no limits set = can use unlimited resources
+Requests: <none>    ← no requests set = scheduler has no guidance
+```
+
+## Fix
 
 ```yaml
-# Always set both requests and limits
+# Always add this to every container in every deployment
 resources:
   requests:
-    cpu: "100m"
-    memory: "128Mi"
+    cpu: "100m"      # minimum guaranteed
+    memory: "128Mi"  # minimum guaranteed
   limits:
-    cpu: "500m"
-    memory: "256Mi"
+    cpu: "500m"      # maximum allowed
+    memory: "256Mi"  # maximum allowed
 ```
 
 ---
 
-## Issue 15 — HPA Not Scaling
+# Issue 15 — HPA Not Scaling
 
-**What it means:** HPA is configured but pods don't scale under load.
+## What Is Happening?
 
-### Diagnose
+HPA (Horizontal Pod Autoscaler) automatically adds more pods when your app is busy. But it needs a **Metrics Server** to know how busy the app is.
+
+If Metrics Server is not installed or broken — HPA cannot see CPU usage — so it never scales. Your app stays slow under load instead of spinning up more pods.
+
+## How to Spot It
 
 ```bash
-# Step 1 — Check HPA status
 kubectl get hpa -n <namespace>
-# NAME    REFERENCE       TARGETS         MINPODS  MAXPODS  REPLICAS
-# my-hpa  Deployment/app  <unknown>/70%   2        10       2
-# <unknown> = metrics server can't get data
-
-# Step 2 — Check if metrics server is running
-kubectl get pods -n kube-system | grep metrics-server
-
-# Step 3 — Test metrics directly
-kubectl top pods -n <namespace>
-# If this fails — metrics server is the problem
-
-# Step 4 — Check HPA events
-kubectl describe hpa <hpa-name> -n <namespace>
-# "failed to get cpu utilization" ← metrics server issue
 ```
 
-### Fix
+```
+NAME     REFERENCE          TARGETS         MINPODS   MAXPODS   REPLICAS
+app-hpa  Deployment/my-app  <unknown>/70%   2         10        2
+                            ^^^^^^^^^
+                            ← <unknown> means HPA cannot read CPU data
+                            ← pods will never scale even under heavy load
+```
+
+## Fix
 
 ```bash
-# Install metrics server
+# Check if Metrics Server is running
+kubectl get pods -n kube-system | grep metrics-server
+
+# Install Metrics Server if missing
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 
-# For Kind/kubeadm — add --kubelet-insecure-tls flag
+# For Kind clusters — also add this flag (Kind uses self-signed certs)
 kubectl patch deployment metrics-server -n kube-system \
   --type=json \
   -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
@@ -657,224 +772,276 @@ kubectl patch deployment metrics-server -n kube-system \
 
 ---
 
-# Category 4 — Configuration Errors
+# Issue 16 — Missing Secret or ConfigMap
 
----
+## What Is Happening?
 
-## Issue 16 — Missing Secret / ConfigMap
+Your app needs passwords, API keys, or configuration values at startup. These are stored in Kubernetes **Secrets** and **ConfigMaps**. If they are missing — the app cannot start at all.
 
-### Diagnose
+Like a chef arriving but the recipe book and ingredients list are missing.
+
+## How to Spot It
 
 ```bash
-# Pod will show: CreateContainerConfigError or CrashLoopBackOff
-kubectl describe pod <pod-name> -n <namespace>
-# Events:
-#   Error: secret "my-secret" not found
-#   Error: couldn't find key DB_PASSWORD in Secret
-
-# Check what exists
-kubectl get secrets -n <namespace>
-kubectl get configmaps -n <namespace>
+kubectl get pods -n <namespace>
 ```
 
-### Fix
+```
+NAME          READY   STATUS                       RESTARTS   AGE
+api-xxx       0/1     CreateContainerConfigError   0          2m
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^
+                      ← cannot even create the container — config is missing
+```
+
+## How to Find the Cause
 
 ```bash
-# Create missing secret
-kubectl create secret generic my-secret \
+kubectl describe pod <pod-name> -n <namespace>
+```
+
+```
+Events:
+  Warning  Failed  30s  kubelet
+           Error: secret "db-credentials" not found   ← this secret is missing
+```
+
+## Fix
+
+```bash
+# Create the missing secret
+kubectl create secret generic db-credentials \
   --from-literal=DB_PASSWORD=mypassword \
   --from-literal=DB_USER=admin \
   -n <namespace>
 
-# Restart pods to pick up the new secret
+# Restart the pod
 kubectl rollout restart deployment <name> -n <namespace>
 ```
 
 ---
 
-## Issue 17 — Wrong Environment Variable
+# Issue 17 — Wrong Environment Variable
 
-### Diagnose
+## What Is Happening?
+
+The app has the right config — but the value is wrong. For example, DB_HOST is set to `localhost` instead of the actual database service name. The app starts fine but fails when it tries to connect.
+
+## How to Spot It
 
 ```bash
-# Check what env vars are actually set in the running pod
-kubectl exec <pod-name> -n <namespace> -- env | grep DB_
-
-# Compare with what's defined in the deployment
-kubectl describe deployment <name> -n <namespace> | grep -A5 Environment
+# Check what the running pod actually sees
+kubectl exec <pod-name> -n <namespace> -- env | grep DB
 ```
 
-### Fix
+```
+DB_HOST=localhost    ← app is trying to connect to itself (no DB there)
+DB_PORT=5432
+```
+
+## Fix
 
 ```bash
-# Update the env var
+# Update the environment variable
 kubectl set env deployment/<name> -n <namespace> \
   DB_HOST=postgres-svc.database.svc.cluster.local
 
-# Rollout restart to apply
+# Restart pods
 kubectl rollout restart deployment <name> -n <namespace>
 ```
 
 ---
 
-## Issue 18 — Liveness Probe Failing
+# Issue 18 — Liveness Probe Failing
 
-**What it means:** Pod keeps restarting every few minutes — probe says it's dead.
+## What Is Happening?
 
-### Diagnose
+Kubernetes checks if your app is alive using a Liveness Probe — it calls a health check URL. If the URL returns an error, Kubernetes thinks the app is dead and **restarts it**.
+
+If you configure the wrong URL, Kubernetes keeps restarting a perfectly healthy app.
+
+## How to Spot It
 
 ```bash
-# Events will show probe failures
 kubectl describe pod <pod-name> -n <namespace>
-# Liveness probe failed: HTTP probe failed with statuscode: 404
-
-# Test the probe endpoint manually from inside the pod
-kubectl exec <pod-name> -n <namespace> -- \
-  curl -s http://localhost:8080/health
-# If 404 — wrong path in probe config
 ```
 
-### Fix
+```
+Events:
+  Warning  Unhealthy  30s  kubelet
+           Liveness probe failed: HTTP probe failed with statuscode: 404
+           ← Kubernetes called /healthz but the app only has /health
+  Warning  Killing    30s  kubelet
+           Container failed liveness probe, will be restarted
+           ← app gets killed and restarted unnecessarily
+```
+
+## Fix
 
 ```yaml
 livenessProbe:
   httpGet:
-    path: /health        # must exist in your app
+    path: /health      ← must exactly match a URL your app responds to
     port: 8080
-  initialDelaySeconds: 30  # give app time to start before first probe
+  initialDelaySeconds: 30   ← wait 30s before first check (give app time to start)
   periodSeconds: 10
   failureThreshold: 3
 ```
 
 ---
 
-## Issue 19 — Readiness Probe Failing
+# Issue 19 — Readiness Probe Failing
 
-**What it means:** Pod runs but never receives traffic — readiness keeps failing.
+## What Is Happening?
 
-### Diagnose
+Similar to Liveness Probe, but the Readiness Probe tells Kubernetes: "is this pod ready to receive traffic?"
+
+If the probe fails, the pod gets **removed from the service** — no traffic reaches it — but it stays running.
+
+Most common reason: **the probe fires too early** before the app has finished starting up.
+
+## How to Spot It
 
 ```bash
-kubectl describe pod <pod-name> -n <namespace>
-# Readiness probe failed: connection refused
-# → app hasn't started yet but probe fires too early
-
-kubectl get pod <pod-name> -n <namespace>
-# READY column shows 0/1 — pod excluded from service endpoints
+kubectl get pods -n <namespace>
 ```
 
-### Fix
+```
+NAME          READY   STATUS    RESTARTS   AGE
+api-xxx       0/1     Running   0          5m
+              ^^^
+              ← 0/1 = pod is Running but NOT READY
+              ← 0 traffic is going to this pod
+              ← service endpoints will show <none>
+```
+
+## Fix
 
 ```yaml
 readinessProbe:
   httpGet:
     path: /ready
     port: 8080
-  initialDelaySeconds: 15    # wait before first check
+  initialDelaySeconds: 15    ← wait 15 seconds before first check
   periodSeconds: 5
-  failureThreshold: 6        # allow more failures before excluding
+  failureThreshold: 6        ← allow 6 failures before removing from service
 ```
 
 ---
 
-## Issue 20 — Wrong Image Tag (`:latest`)
+# Issue 20 — Using `:latest` Image Tag
 
-**What it means:** Different nodes have different cached versions of `latest`. Inconsistent behavior.
+## What Is Happening?
 
-### Fix
+`:latest` means "give me the newest version". The problem: different nodes in your cluster may have **different cached versions** of "latest". Node A cached it 3 days ago, Node B just pulled a newer version.
+
+Result: two pods running different code — some requests work, others fail randomly.
+
+## Fix
 
 ```yaml
-# Never use :latest in production
-image: myrepo/myapp:latest    # BAD
+# Never do this in production:
+image: myrepo/myapp:latest      ← different nodes = different code
 
-# Always use a specific tag
-image: myrepo/myapp:v1.2.3    # GOOD
-image: myrepo/myapp:sha-abc123 # BEST (immutable)
+# Always use an exact version:
+image: myrepo/myapp:v1.2.3      ← everyone runs the same code
+image: myrepo/myapp:sha-abc123  ← even better — tied to a specific Git commit
 ```
 
 ---
 
-# Category 5 — Storage Issues
+# Issue 21 — PVC Stuck in Pending
 
----
+## What Is Happening?
 
-## Issue 21 — PVC Stuck in Pending
+A PVC (Persistent Volume Claim) is like asking for a storage box for your data. If you ask for a box that does not exist (wrong StorageClass) — you wait forever.
 
-### Diagnose
+Database pods need storage. No storage = DB pod never starts = all your other services that need the DB also fail.
+
+## How to Spot It
 
 ```bash
-# Step 1 — Check PVC status
 kubectl get pvc -n <namespace>
-# NAME     STATUS    VOLUME   CAPACITY   STORAGECLASS
-# my-pvc   Pending                       fast-ssd     ← wrong StorageClass
-
-# Step 2 — Describe shows why
-kubectl describe pvc <pvc-name> -n <namespace>
-# Events:
-#   no persistent volumes available for this claim
-#   storageclass "fast-ssd" not found
-
-# Step 3 — Check available StorageClasses
-kubectl get storageclass
 ```
 
-### Fix
+```
+NAME          STATUS    STORAGECLASS   AGE
+postgres-pvc  Pending   fast-ssd       10m
+              ^^^^^^^   ^^^^^^^^
+              ← waiting for 10 minutes
+              ← StorageClass "fast-ssd" does not exist
+```
+
+## Fix
 
 ```bash
-# Use an existing StorageClass
-kubectl patch pvc <pvc-name> -n <namespace> \
-  -p '{"spec":{"storageClassName":"standard"}}'
+# Check what StorageClasses actually exist
+kubectl get storageclass
 
-# Or delete and recreate with correct StorageClass
-kubectl delete pvc <pvc-name> -n <namespace>
-# Edit YAML — change storageClassName to match available one
+# Delete old PVC and recreate with correct StorageClass
+kubectl delete pvc postgres-pvc -n <namespace>
+# Edit PVC YAML — change storageClassName to one that exists (e.g. "standard")
 kubectl apply -f pvc.yaml
 ```
 
 ---
 
-## Issue 22 — PV Not Released
+# Issue 22 — PV Not Released
 
-### Diagnose
+## What Is Happening?
+
+After you delete a PVC, the underlying storage (PV) may stay in "Released" state — not reusable. New PVCs cannot bind to it. It just sits there taking up space.
+
+## How to Spot It
 
 ```bash
 kubectl get pv
-# NAME     CAPACITY  STATUS     CLAIM
-# my-pv    10Gi      Released   ← not reusable — reclaim policy is Retain
 ```
 
-### Fix
+```
+NAME        STATUS     CLAIM
+pv-data-01  Released   database/postgres-pvc   ← old claim deleted but PV is stuck
+```
+
+## Fix
 
 ```bash
-# Manually release the PV by removing the claimRef
-kubectl patch pv <pv-name> \
+# Clear the old claim reference — makes PV available again
+kubectl patch pv pv-data-01 \
   -p '{"spec":{"claimRef":null}}'
-# Status changes: Released → Available
+
+# Now status changes to Available and new PVCs can bind to it
 ```
 
 ---
 
-## Issue 23 — Disk Full on Node
+# Issue 23 — Disk Full on Node
 
-### Diagnose
+## What Is Happening?
+
+Container logs are stored on the node. If logs are not rotated (deleted periodically), one noisy app can fill the entire disk. When the disk is full — all pods on that node get evicted.
+
+## How to Spot It
 
 ```bash
-# Check node disk pressure
 kubectl describe node <node-name> | grep DiskPressure
-# DiskPressure: True
-
-# SSH into node and check
-df -h
-du -sh /var/log/containers/*  | sort -rh | head -10
 ```
 
-### Fix
+```
+DiskPressure: True    ← disk is full
+```
+
+## Fix
 
 ```bash
-# Clean up unused docker images and containers
+# Get a shell on the node to investigate
+kubectl debug node/<node-name> -it --image=ubuntu
+
+# Inside: check disk usage
+df -h
+du -sh /var/log/containers/* | sort -rh | head -10
+
+# Clean up unused container images
 crictl rmi --prune
-# Or
-docker system prune -f
 
 # Delete old logs
 find /var/log/containers -name "*.log" -mtime +7 -delete
@@ -882,131 +1049,181 @@ find /var/log/containers -name "*.log" -mtime +7 -delete
 
 ---
 
-# Category 6 — Deployment & Rollout
+# Issue 24 — Deployment Rollout Stuck
 
----
+## What Is Happening?
 
-## Issue 24 — Deployment Stuck (Rollout Not Completing)
+When you deploy a new version, Kubernetes starts the new pod and waits for it to be healthy before removing the old one. If the new pod keeps crashing — the rollout is stuck forever. The old version keeps running (which is good) but the new version never deploys.
 
-### Diagnose
+## How to Spot It
 
 ```bash
-# Step 1 — Check rollout status
-kubectl rollout status deployment/<name> -n <namespace>
-# Waiting for deployment "my-app" rollout to finish: 1 out of 2 new replicas...
-
-# Step 2 — Check why new pod is not ready
-kubectl get pods -n <namespace>
-# New pod is CrashLoopBackOff or ImagePullBackOff
-
-# Step 3 — Check deployment events
-kubectl describe deployment <name> -n <namespace>
+kubectl rollout status deployment/my-app -n <namespace>
 ```
 
-### Fix
+```
+Waiting for deployment "my-app" rollout to finish:
+1 out of 2 new replicas have been updated...
+← stuck here for 10+ minutes = new pod is unhealthy
+```
+
+## Fix
 
 ```bash
-# Option 1 — fix the issue in the new image, redeploy
+# Option 1 — fix the new version and redeploy
 kubectl set image deployment/<name> <container>=myrepo/myapp:v1.4 -n <namespace>
 
-# Option 2 — rollback to previous working version
+# Option 2 — rollback to last working version immediately
 kubectl rollout undo deployment/<name> -n <namespace>
-
-# Verify rollback
-kubectl rollout status deployment/<name> -n <namespace>
 ```
 
 ---
 
-## Issue 25 — Rollback Needed
+# Issue 25 — Rollback Needed
 
-### Fix
+## What Is Happening?
+
+You deployed a new version and it is broken in production. You need to go back to the last working version immediately.
+
+## Fix
 
 ```bash
-# Check rollout history
-kubectl rollout history deployment/<name> -n <namespace>
+# See all versions deployed
+kubectl rollout history deployment/my-app -n <namespace>
+```
 
-# Rollback to previous version
-kubectl rollout undo deployment/<name> -n <namespace>
+```
+REVISION   CHANGE-CAUSE
+1          version 1.0.0    ← first deploy
+2          version 1.1.0    ← this was working
+3          version 2.0.0    ← current, broken
+```
 
-# Rollback to specific revision
-kubectl rollout undo deployment/<name> -n <namespace> --to-revision=3
+```bash
+# Go back to revision 2
+kubectl rollout undo deployment/my-app -n <namespace> --to-revision=2
+
+# Confirm it is back
+kubectl rollout status deployment/my-app -n <namespace>
+# deployment "my-app" successfully rolled out
 ```
 
 ---
 
-# Category 7 — Observability Issues
+# Issue 26 — Too Many Pods, Not Enough Nodes
+
+## What Is Happening?
+
+You scaled up to 20 replicas but only have 4 nodes with limited resources. Extra pods go into Pending state — no room for them.
+
+## Fix
+
+```bash
+# Check node capacity
+kubectl describe nodes | grep -A5 "Allocated resources"
+
+# Scale down to what fits
+kubectl scale deployment <name> --replicas=8 -n <namespace>
+
+# OR reduce resource requests so more pods fit per node
+# OR add more nodes to the cluster
+```
 
 ---
 
-## Issue 27 — No Logs in New Relic
+# Issue 27 — No Logs in New Relic
 
-### Diagnose
+## What Is Happening?
+
+The Fluent Bit log forwarder collects logs from all pods and sends them to New Relic. If the forwarder is down or using a wrong API key — no logs appear in New Relic, even though pods are running fine.
+
+## How to Spot It
+
+In New Relic → Logs → search: `cluster_name = 'kind-calico-prod'` → **No results**
 
 ```bash
-# Check if log forwarder is running
+# Check if the log forwarder pod is healthy
 kubectl get pods -n newrelic | grep logging
-# nri-bundle-newrelic-logging-xxx   1/1   Running
-
-# Check Fluent Bit logs
-kubectl logs -n newrelic -l app.kubernetes.io/name=newrelic-logging --tail=30
-# Look for: "authentication failed" or "connection refused"
 ```
 
-### Fix
+```
+NAME                             READY   STATUS             RESTARTS
+nri-bundle-newrelic-logging-xxx  0/1     CrashLoopBackOff   8
+← log forwarder is crashing = no logs going to New Relic
+```
+
+## Fix
 
 ```bash
-# Verify license key is correct
-kubectl get secret nri-bundle-newrelic-logging-config -n newrelic \
-  -o jsonpath='{.data.LICENSE_KEY}' | base64 -d
+# Check logs of the forwarder itself
+kubectl logs -n newrelic -l app.kubernetes.io/name=newrelic-logging --tail=20
 
-# Reinstall with correct key
+# If it says "401 Unauthorized" or "403 Forbidden" → wrong license key
+# Update values.yaml with correct license key and re-upgrade:
 helm upgrade nri-bundle newrelic/nri-bundle \
-  --namespace newrelic \
-  --values values.yaml
+  --namespace newrelic --values values.yaml
 ```
 
 ---
 
-## Issue 28 — Metrics Missing in New Relic
+# Issue 28 — Metrics Missing in New Relic
 
-### Diagnose
+## What Is Happening?
+
+Metrics (CPU, memory, pod counts) are collected by the infrastructure agent and kube-state-metrics. If these pods are unhealthy — the New Relic dashboard shows empty graphs.
+
+## Fix
 
 ```bash
-# Check Prometheus scraper
-kubectl get pods -n newrelic | grep prometheus
-kubectl logs -n newrelic -l app.kubernetes.io/name=nri-prometheus --tail=30
+# Check all New Relic pods
+kubectl get pods -n newrelic
 
-# Check if kube-state-metrics is running
-kubectl get pods -n newrelic | grep kube-state
+# Check infrastructure agent logs for errors
+kubectl logs -n newrelic -l app.kubernetes.io/component=kubelet --tail=20
+# If "401" or "403" errors → wrong license key
 ```
 
 ---
 
-## Issue 30 — RBAC Permission Denied
+# Issue 29 — Alert Storm (Too Many Alerts at Once)
 
-**What it means:** Pod tries to call the Kubernetes API but gets 403 Forbidden.
+## What Is Happening?
 
-### Diagnose
+One real problem triggers dozens of alerts. For example: one node goes down → 20 pods evicted → 20 separate "Pod Not Ready" alerts fire → your phone explodes with notifications.
+
+## Fix in New Relic
+
+1. Go to **Alerts → Policies**
+2. Change **Incident Preference** from `Per Condition` to `Per Policy`
+   - This groups all related alerts into ONE incident
+3. Add `min:` to thresholds so small blips don't trigger alerts
+4. Use `SINCE 5 minutes ago` instead of `SINCE 1 minute ago` — reduces false alarms
+
+---
+
+# Issue 30 — RBAC Permission Denied
+
+## What Is Happening?
+
+Some apps need to talk to the Kubernetes API (e.g., monitoring agents, ArgoCD, operators). By default, pods have very limited permissions. If the app tries to list pods or read secrets — it gets **403 Forbidden**.
+
+## How to Spot It
 
 ```bash
-# Check pod logs for RBAC error
 kubectl logs <pod-name> -n <namespace>
-# Error: pods is forbidden: User "system:serviceaccount:default:my-sa"
-#        cannot list resource "pods"
-
-# Check what ServiceAccount the pod uses
-kubectl get pod <pod-name> -n <namespace> \
-  -o jsonpath='{.spec.serviceAccountName}'
-
-# Check existing ClusterRoleBindings for that SA
-kubectl get clusterrolebindings -o wide | grep <service-account-name>
 ```
 
-### Fix
+```
+Error: pods is forbidden:
+User "system:serviceaccount:monitoring:my-agent"
+cannot list resource "pods" in API group ""
+Status: 403
+```
+
+## Fix
 
 ```bash
-# Create ClusterRole and bind it to the ServiceAccount
+# Create a Role that allows reading pods
 cat <<EOF | kubectl apply -f -
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -1014,7 +1231,7 @@ metadata:
   name: pod-reader
 rules:
 - apiGroups: [""]
-  resources: ["pods", "services", "endpoints"]
+  resources: ["pods", "services"]
   verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -1023,8 +1240,8 @@ metadata:
   name: pod-reader-binding
 subjects:
 - kind: ServiceAccount
-  name: my-sa
-  namespace: default
+  name: my-agent            ← the service account your pod uses
+  namespace: monitoring
 roleRef:
   kind: ClusterRole
   name: pod-reader
@@ -1034,37 +1251,21 @@ EOF
 
 ---
 
-## New Relic — Observability Workflow
+# Quick Cheat Sheet — Which Command for Which Problem
 
-```
-Alert fires in New Relic
-        │
-        ▼
-1. Alerts → Issues & Activity
-   └─ Which condition? Which pod/node?
-        │
-        ▼
-2. Infrastructure → Kubernetes → kind-calico-prod
-   └─ Pods tab → find the red pod
-   └─ Click pod → Exit Code? Restart Count? View Logs?
-        │
-        ▼
-3. APM → Services
-   └─ Error rate spike? Response time high?
-   └─ Transactions → find the slow/failing endpoint
-   └─ Distributed Tracing → trace the full request path
-        │
-        ▼
-4. Logs → search cluster_name = 'kind-calico-prod'
-   └─ Filter: level = error
-   └─ Correlate timestamp with the alert
-        │
-        ▼
-5. kubectl to confirm and fix
-   └─ describe pod → find root cause
-   └─ logs --previous → read crash output
-   └─ rollout restart / rollout undo
-```
+| You see this | Run this first |
+|---|---|
+| `CrashLoopBackOff` | `kubectl logs <pod> --previous` |
+| `OOMKilled` | `kubectl describe pod <pod>` → check Exit Code 137 |
+| `ImagePullBackOff` | `kubectl describe pod <pod>` → check Events |
+| `Pending` (never starts) | `kubectl describe pod <pod>` → check Events |
+| `Init:0/1` | `kubectl logs <pod> -c <init-container-name>` |
+| `0/1 Running` (not ready) | `kubectl describe pod <pod>` → check Readiness probe |
+| `Evicted` | `kubectl describe pod <pod>` → check Message |
+| Service not working | `kubectl get endpoints <service>` → is it `<none>`? |
+| App slow, no errors | `kubectl top pods` → is CPU at 100% of limit? |
+| HPA not scaling | `kubectl get hpa` → is TARGETS showing `<unknown>`? |
+| No logs in New Relic | `kubectl get pods -n newrelic` → any pod not Running? |
 
 ---
 
